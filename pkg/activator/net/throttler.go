@@ -20,15 +20,23 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	pkgnet "knative.dev/networking/pkg/apis/networking"
@@ -39,12 +47,15 @@ import (
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/logging/logkey"
 	"knative.dev/pkg/reconciler"
+	"knative.dev/serving/pkg/activator"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
 	servinglisters "knative.dev/serving/pkg/client/listers/serving/v1"
 	"knative.dev/serving/pkg/networking"
 	"knative.dev/serving/pkg/queue"
+
+	khala "knative.dev/serving/pkg/proto"
 )
 
 const (
@@ -166,11 +177,17 @@ type revisionThrottler struct {
 	mux sync.RWMutex
 
 	logger *zap.SugaredLogger
+
+	khalaGrpcClient []khala.KhalaKnativeIntegrationClient
+
+	nodes   []string
+	nodeIdx int
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
 	containerConcurrency int, proto string,
 	breakerParams queue.BreakerParams,
+	nodes []string,
 	logger *zap.SugaredLogger) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
@@ -190,6 +207,24 @@ func newRevisionThrottler(revID types.NamespacedName,
 		revBreaker = queue.NewBreaker(breakerParams)
 		lbp = newRoundRobinPolicy()
 	}
+
+	orchClients := []khala.KhalaKnativeIntegrationClient{}
+	logger.Infof("update interval: %v", activator.GetEnv("UPDATE_INTERVAL", -6))
+	logger.Infof("keepalive duration: %v", activator.GetEnv("KEEPALIVE_DURATION", -6))
+
+	for _, node := range nodes {
+		// Create a gRPC connection to the orchestrator at the given node and port 8000
+		orchestratorConn, err := grpc.Dial(node+":8000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+		var orchClient khala.KhalaKnativeIntegrationClient
+		if err != nil {
+			// If there is an error connecting, log the error and stop the program
+			logger.Fatalf("khala: failed to connect to vm-orchestrator: %v", err)
+		} else {
+			orchClient = khala.NewKhalaKnativeIntegrationClient(orchestratorConn)
+		}
+		orchClients = append(orchClients, orchClient)
+	}
+
 	return &revisionThrottler{
 		revID:                revID,
 		containerConcurrency: containerConcurrency,
@@ -198,6 +233,9 @@ func newRevisionThrottler(revID types.NamespacedName,
 		protocol:             proto,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
+
+		khalaGrpcClient: orchClients,
+		nodes:           nodes,
 	}
 }
 
@@ -215,31 +253,100 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 	return rt.lbPolicy(ctx, rt.assignedTrackers)
 }
 
-func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
-	var ret error
+var MapIPtoVmID = make(map[string]string)
 
-	// Retrying infinitely as long as we receive no dest. Outer semaphore and inner
-	// pod capacity are not changed atomically, hence they can race each other. We
-	// "reenqueue" requests should that happen.
-	reenqueue := true
-	for reenqueue {
-		reenqueue = false
-		if err := rt.breaker.Maybe(ctx, func() {
-			cb, tracker := rt.acquireDest(ctx)
-			if tracker == nil {
-				// This can happen if individual requests raced each other or if pod
-				// capacity was decreased after passing the outer semaphore.
-				reenqueue = true
-				return
-			}
-			defer cb()
-			// We already reserved a guaranteed spot. So just execute the passed functor.
-			ret = function(tracker.dest)
-		}); err != nil {
-			return err
+func cleanUpRemovedVMs(khalaOrchClients []khala.KhalaKnativeIntegrationClient, logger *zap.SugaredLogger) {
+	logger.Infof("khala: cleaning up removed vms: %v", activator.ToRemoveVMs)
+	// Loop through all VMs that need to be removed
+	for _, vm := range activator.ToRemoveVMs {
+		arr := strings.Split(MapIPtoVmID[vm.IPAddress], "__")
+		vmID := arr[0]
+		orchID := arr[1]
+		// In a real-world scenario, you might want to select the client based on VM location or other logic.
+		if len(khalaOrchClients) == 0 {
+			logger.Warnf("khala: No orchestrator clients available to kill VM: %v", vm.IPAddress)
+			continue
+		}
+		orchIdx, _ := strconv.Atoi(orchID)
+		client := khalaOrchClients[orchIdx]
+		_, err := client.RemoveVM(context.Background(), &khala.RemoveVMRequest{
+			VmId: vmID,
+		})
+		if err != nil {
+			logger.Errorf("khala: Failed to kill VM %v: %v", vm.IPAddress, err)
+		} else {
+			logger.Infof("khala: Successfully killed VM %v", vm.IPAddress)
+			activator.RemoveVMRequestHistoryByIP(vm.IPAddress)
 		}
 	}
-	return ret
+	// After attempting to kill all VMs, clear the ToRemoveVMs slice
+	activator.ToRemoveVMs = []activator.VMRequestInfo{}
+}
+
+var removeVMsOnce sync.Once
+
+// baseline version
+func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
+	removeVMsOnce.Do(func() {
+		go func() {
+			// This goroutine will run forever, cleaning up VMs every 10 seconds.
+			for {
+				cleanUpRemovedVMs(rt.khalaGrpcClient, rt.logger)
+				time.Sleep(5 * time.Second)
+			}
+		}()
+	})
+
+	// Get the string representation of revID, e.g., "namespace/name-abc123"
+	// "name" will refer to the workload name, hence will help to get the snapshot name to restore
+	revIDStr := rt.revID.String()
+
+	slashIdx := strings.Index(revIDStr, "/")
+	dashIdx := strings.LastIndex(revIDStr, "-")
+
+	var extractedName string
+	if slashIdx != -1 && dashIdx != -1 && dashIdx > slashIdx {
+		extractedName = revIDStr[slashIdx+1 : dashIdx]
+	} else if slashIdx != -1 {
+		extractedName = revIDStr[slashIdx+1:]
+	} else {
+		extractedName = revIDStr
+	}
+	rt.logger.Infof("khala: extracted revID: %s", extractedName)
+
+	// get not in use vms but keep alived
+	notInUseVMs := activator.GetNotInUseVMs(extractedName)
+	rt.logger.Infof("khala: not in use vms: %v", notInUseVMs)
+
+	// move to next node uring round robin
+	rt.nodeIdx = (rt.nodeIdx + 1) % len(rt.nodes)
+
+	// if not in use vms is not empty, then use existing not in use vm
+	if len(notInUseVMs) > 0 {
+		vmIP := notInUseVMs[0].IPAddress
+		activator.SetLastRequestAt(extractedName, vmIP, time.Now().UnixMilli())
+		activator.SetInUse(extractedName, vmIP, true)
+		rt.logger.Infof("khala: vm reused ip: %v", vmIP)
+		return function(vmIP)
+	} else {
+		// addvmrequest from khalanativeintegration
+		restoreVM, err := rt.khalaGrpcClient[rt.nodeIdx].AddVM(context.Background(), &khala.AddVMRequest{
+			VmName: extractedName,
+		})
+		if err != nil {
+			rt.logger.Errorf("khala: failed to add vm: %v", err)
+			return err
+		}
+
+		vm_grpc_server_port := restoreVM.RpcPort
+		vm_ip := rt.nodes[rt.nodeIdx] + ":" + vm_grpc_server_port             // node_ip:vm_grpc_port
+		rt.logger.Infof("khala: vm ip: %v", vm_ip)
+		MapIPtoVmID[vm_ip] = restoreVM.VmId + "__" + strconv.Itoa(rt.nodeIdx) // vm_id__orch_index
+		activator.AddVMRequestHistory(extractedName, vm_ip, time.Now().UnixMilli())
+
+		activator.SetInUse(extractedName, vm_ip, true)
+		return function(vm_ip)
+	}
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
@@ -455,6 +562,8 @@ type Throttler struct {
 	ipAddress               string // The IP address of this activator.
 	logger                  *zap.SugaredLogger
 	epsUpdateCh             chan *corev1.Endpoints
+
+	nodes []string
 }
 
 // NewThrottler creates a new Throttler
@@ -466,6 +575,8 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		ipAddress:          ipAddr,
 		logger:             logging.FromContext(ctx),
 		epsUpdateCh:        make(chan *corev1.Endpoints),
+
+		nodes: getNodes(ctx),
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -489,6 +600,45 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 		},
 	})
 	return t
+}
+
+func getNodes(ctx context.Context) []string {
+	logger := logging.FromContext(ctx)
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		logger.Fatalf("Error building in-cluster config: %s\n", err.Error())
+	}
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		logger.Fatalf("Error creating clientset: %s\n", err.Error())
+	}
+
+	// Get the node list
+	nodeList, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		logger.Fatalf("Error getting node list: %s\n", err.Error())
+	}
+
+	// Print the CPU usage for each node
+	nodes := []string{}
+	for _, n := range nodeList.Items {
+		if n.Labels["loader-nodetype"] != "worker" && n.Labels["loader-nodetype"] != "singlenode" {
+			continue
+		}
+
+		var ip string
+		for _, addr := range n.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				ip = addr.Address
+				break
+			}
+		}
+		nodes = append(nodes, ip)
+	}
+
+	logger.Infof("Nodes: %v", nodes)
+	return nodes
 }
 
 // Run starts the throttler and blocks until the context is done.
@@ -546,6 +696,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			int(rev.Spec.GetContainerConcurrency()),
 			pkgnet.ServicePortName(rev.GetProtocol()),
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
+			t.nodes,
 			t.logger,
 		)
 		t.revisionThrottlers[revID] = revThrottler
