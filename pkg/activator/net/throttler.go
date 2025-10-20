@@ -20,15 +20,10 @@ import (
 	"context"
 	"net/http"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
-	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,8 +49,6 @@ import (
 	servinglisters "knative.dev/serving/pkg/client/listers/serving/v1"
 	"knative.dev/serving/pkg/networking"
 	"knative.dev/serving/pkg/queue"
-
-	khala "knative.dev/serving/pkg/proto"
 )
 
 const (
@@ -178,10 +171,8 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	khalaGrpcClient []khala.KhalaKnativeIntegrationClient
-
-	nodes   []string
-	nodeIdx int
+	nodes  []string
+	vmList *activator.VMList
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -207,24 +198,12 @@ func newRevisionThrottler(revID types.NamespacedName,
 		revBreaker = queue.NewBreaker(breakerParams)
 		lbp = newRoundRobinPolicy()
 	}
+	extractedName := activator.ExtractName(revID.String())
+	logger.Debugf("khala: extracted revID: %s", extractedName)
 
-	orchClients := []khala.KhalaKnativeIntegrationClient{}
-	logger.Infof("update interval: %v", activator.GetEnv("UPDATE_INTERVAL", -6))
-	logger.Infof("keepalive duration: %v", activator.GetEnv("KEEPALIVE_DURATION", -6))
+	vmList := activator.NewRevVMList(extractedName, nodes, logger)
 
-	for _, node := range nodes {
-		// Create a gRPC connection to the orchestrator at the given node and port 8000
-		orchestratorConn, err := grpc.Dial(node+":8000", grpc.WithTransportCredentials(insecure.NewCredentials()))
-		var orchClient khala.KhalaKnativeIntegrationClient
-		if err != nil {
-			// If there is an error connecting, log the error and stop the program
-			logger.Fatalf("khala: failed to connect to vm-orchestrator: %v", err)
-		} else {
-			orchClient = khala.NewKhalaKnativeIntegrationClient(orchestratorConn)
-		}
-		orchClients = append(orchClients, orchClient)
-	}
-
+	vmList.RemoveVMsWithLeastRecentUse(context.Background())
 	return &revisionThrottler{
 		revID:                revID,
 		containerConcurrency: containerConcurrency,
@@ -233,9 +212,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		protocol:             proto,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
-
-		khalaGrpcClient: orchClients,
-		nodes:           nodes,
+		vmList:               vmList,
 	}
 }
 
@@ -253,100 +230,33 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 	return rt.lbPolicy(ctx, rt.assignedTrackers)
 }
 
-var MapIPtoVmID = make(map[string]string)
-
-func cleanUpRemovedVMs(khalaOrchClients []khala.KhalaKnativeIntegrationClient, logger *zap.SugaredLogger) {
-	logger.Infof("khala: cleaning up removed vms: %v", activator.ToRemoveVMs)
-	// Loop through all VMs that need to be removed
-	for _, vm := range activator.ToRemoveVMs {
-		arr := strings.Split(MapIPtoVmID[vm.IPAddress], "__")
-		vmID := arr[0]
-		orchID := arr[1]
-		// In a real-world scenario, you might want to select the client based on VM location or other logic.
-		if len(khalaOrchClients) == 0 {
-			logger.Warnf("khala: No orchestrator clients available to kill VM: %v", vm.IPAddress)
-			continue
-		}
-		orchIdx, _ := strconv.Atoi(orchID)
-		client := khalaOrchClients[orchIdx]
-		_, err := client.RemoveVM(context.Background(), &khala.RemoveVMRequest{
-			VmId: vmID,
-		})
-		if err != nil {
-			logger.Errorf("khala: Failed to kill VM %v: %v", vm.IPAddress, err)
-		} else {
-			logger.Infof("khala: Successfully killed VM %v", vm.IPAddress)
-			activator.RemoveVMRequestHistoryByIP(vm.IPAddress)
-		}
-	}
-	// After attempting to kill all VMs, clear the ToRemoveVMs slice
-	activator.ToRemoveVMs = []activator.VMRequestInfo{}
-}
-
-var removeVMsOnce sync.Once
-
 // baseline version
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
-	removeVMsOnce.Do(func() {
-		go func() {
-			// This goroutine will run forever, cleaning up VMs every 10 seconds.
-			for {
-				cleanUpRemovedVMs(rt.khalaGrpcClient, rt.logger)
-				time.Sleep(5 * time.Second)
-			}
-		}()
-	})
+	var ret error
+	var err error
+	var vm *activator.VMMetadata
 
-	// Get the string representation of revID, e.g., "namespace/name-abc123"
-	// "name" will refer to the workload name, hence will help to get the snapshot name to restore
-	revIDStr := rt.revID.String()
-
-	slashIdx := strings.Index(revIDStr, "/")
-	dashIdx := strings.LastIndex(revIDStr, "-")
-
-	var extractedName string
-	if slashIdx != -1 && dashIdx != -1 && dashIdx > slashIdx {
-		extractedName = revIDStr[slashIdx+1 : dashIdx]
-	} else if slashIdx != -1 {
-		extractedName = revIDStr[slashIdx+1:]
-	} else {
-		extractedName = revIDStr
-	}
-	rt.logger.Infof("khala: extracted revID: %s", extractedName)
-
-	// get not in use vms but keep alived
-	notInUseVMs := activator.GetNotInUseVMs(extractedName)
-	rt.logger.Infof("khala: not in use vms: %v", notInUseVMs)
-
-	// move to next node uring round robin
-	rt.nodeIdx = (rt.nodeIdx + 1) % len(rt.nodes)
-
-	// if not in use vms is not empty, then use existing not in use vm
-	if len(notInUseVMs) > 0 {
-		vmIP := notInUseVMs[0].IPAddress
-		activator.SetLastRequestAt(extractedName, vmIP, time.Now().UnixMilli())
-		activator.SetInUse(extractedName, vmIP, true)
-		rt.logger.Infof("khala: vm reused ip: %v", vmIP)
-		return function(vmIP)
-	} else {
-		// addvmrequest from khalanativeintegration
-		restoreVM, err := rt.khalaGrpcClient[rt.nodeIdx].AddVM(context.Background(), &khala.AddVMRequest{
-			VmName: extractedName,
-		})
+	// Pop out a VM for this request
+	vm = rt.vmList.PopVM()
+	if vm == nil {
+		rt.logger.Infof("khala: no available VM. creating a new one")
+		// No VM available, need to create a new one
+		// Create a new VM for this request
+		vm, err = rt.vmList.CreateVM()
 		if err != nil {
-			rt.logger.Errorf("khala: failed to add vm: %v", err)
+			rt.logger.Errorf("khala: failed to create VM: %v", err)
 			return err
 		}
-
-		vm_grpc_server_port := restoreVM.RpcPort
-		vm_ip := rt.nodes[rt.nodeIdx] + ":" + vm_grpc_server_port             // node_ip:vm_grpc_port
-		rt.logger.Infof("khala: vm ip: %v", vm_ip)
-		MapIPtoVmID[vm_ip] = restoreVM.VmId + "__" + strconv.Itoa(rt.nodeIdx) // vm_id__orch_index
-		activator.AddVMRequestHistory(extractedName, vm_ip, time.Now().UnixMilli())
-
-		activator.SetInUse(extractedName, vm_ip, true)
-		return function(vm_ip)
 	}
+
+	defer func() {
+		// Push the VM back to the stack after use
+		rt.vmList.PushVM(vm)
+	}()
+
+	ret = function(vm.Node + ":" + vm.RPCPort)
+
+	return ret
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
@@ -562,8 +472,7 @@ type Throttler struct {
 	ipAddress               string // The IP address of this activator.
 	logger                  *zap.SugaredLogger
 	epsUpdateCh             chan *corev1.Endpoints
-
-	nodes []string
+	nodes                   []string
 }
 
 // NewThrottler creates a new Throttler

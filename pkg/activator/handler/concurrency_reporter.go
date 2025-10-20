@@ -20,7 +20,6 @@ import (
 	"context"
 	"math"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -83,7 +82,6 @@ func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []a
 // handleRequestIn handles an event of a request coming into the system. Returns the stats
 // the outgoing event should be recorded to.
 func (cr *ConcurrencyReporter) handleRequestIn(event netstats.ReqEvent) *revisionStats {
-	cr.logger.Infof("khala: handleRequestIn: key: %v, type: %v", event.Key, event.Type)
 	stat, msg := cr.getOrCreateStat(event)
 	if msg != nil {
 		cr.statCh <- []asmetrics.StatMessage{*msg}
@@ -92,53 +90,9 @@ func (cr *ConcurrencyReporter) handleRequestIn(event netstats.ReqEvent) *revisio
 	return stat
 }
 
-var removeVMsOnce sync.Once
-
 // handleRequestOut handles an event of a request being done. Takes the stats returned by
 // the handleRequestIn call.
 func (cr *ConcurrencyReporter) handleRequestOut(stat *revisionStats, event netstats.ReqEvent) {
-	cr.logger.Infof("khala: handleRequestOut: key: %v, type: %v", event.Key, event.Type)
-	revIDStr := event.Key.String()
-
-	slashIdx := strings.Index(revIDStr, "/")
-	dashIdx := strings.LastIndex(revIDStr, "-")
-
-	var extractedName string
-	if slashIdx != -1 && dashIdx != -1 && dashIdx > slashIdx {
-		extractedName = revIDStr[slashIdx+1 : dashIdx]
-	} else if slashIdx != -1 {
-		extractedName = revIDStr[slashIdx+1:]
-	} else {
-		extractedName = revIDStr
-	}
-
-	// Use a mutex to ensure thread-safe access to VMRequestHistory and related operations
-	activator.RemoveVMsWithLongEndTime(extractedName)
-	activator.SetOldestVMNotInUse(extractedName, cr.logger)
-
-	cr.logger.Infof("khala: extracted name: %v, vms: %v", extractedName, activator.VMRequestHistory[extractedName])
-
-	removeVMsOnce.Do(func() {
-		go func() {
-			// This goroutine will run forever, cleaning up VMs every 10 seconds.
-			for {
-				// We need to clean up for all keys in VMRequestHistory.
-				// Since VMRequestHistory is a map[string][]VMRequestInfo,
-				// we iterate over all keys and call RemoveVMsWithLongEndTime for each.
-				for name := range activator.VMRequestHistory {
-					activator.RemoveVMsWithLongEndTime(name)
-					for _, vm := range activator.ToRemoveVMs {
-						cr.logger.Infof("khala: to remove vm: %v", vm.IPAddress)
-					}
-				}
-				// Sleep for 10 seconds before the next cleanup.
-				// time.Sleep(5 * time.Second)
-				nb_seconds := activator.GetEnv("UPDATE_INTERVAL", 5)
-				time.Sleep(time.Duration(nb_seconds) * time.Second)
-			}
-		}()
-	})
-
 	stat.stats.HandleEvent(event)
 	stat.refs.Dec()
 }
