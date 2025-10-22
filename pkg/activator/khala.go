@@ -20,6 +20,7 @@ type VMMetadata struct {
 	RPCPort        string
 	Node           string
 	LastTimeUsedMs int64
+	RetryCount     int
 }
 
 type VMList struct {
@@ -27,6 +28,7 @@ type VMList struct {
 	VMs                  []*VMMetadata
 	Workload             string
 	Nodes                []string
+	NodeVMCount          map[string]int
 	nextNodeIndex        int
 	khalaGrpcClient      map[string]khala.KhalaKnativeIntegrationClient
 	keepaliveDurationSec int
@@ -57,12 +59,16 @@ func NewRevVMList(extractedName string, nodes []string, logger *zap.SugaredLogge
 	// Initialize the map and pre-allocate a slice for each node.
 	VMs := make([]*VMMetadata, 0)
 
-	// run once lock to avoid race
+	NodeVMCount := make(map[string]int)
+	for _, node := range nodes {
+		NodeVMCount[node] = 0
+	}
 
 	return &VMList{
 		VMs:                  VMs,
 		Workload:             extractedName,
 		Nodes:                nodes,
+		NodeVMCount:          NodeVMCount,
 		nextNodeIndex:        0,
 		khalaGrpcClient:      khalaGrpcClient,
 		keepaliveDurationSec: keepAlive,
@@ -81,7 +87,6 @@ func (vml *VMList) PopVM() *VMMetadata {
 		return nil
 	}
 
-	// 3. Check for available VMs on that specific node.
 	if len(vml.VMs) > 0 {
 		// Pop the last element (which is the most recently used).
 		lastIndex := len(vml.VMs) - 1
@@ -98,12 +103,14 @@ func (vml *VMList) PopVM() *VMMetadata {
 }
 
 // PushVM adds a VM back to its node-specific list.
-func (vml *VMList) PushVM(vm *VMMetadata) {
+func (vml *VMList) PushVM(vm *VMMetadata, resetRetryCount bool) {
 	vml.Lock.Lock()
 	defer vml.Lock.Unlock()
 
 	vm.LastTimeUsedMs = time.Now().UnixMilli()
-
+	if resetRetryCount {
+		vm.RetryCount = 0
+	}
 	node := vm.Node
 	vml.VMs = append(vml.VMs, vm)
 
@@ -120,15 +127,10 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 	}
 
 	minNode := vml.Nodes[0]
-	minCount := len(vml.VMs)
-
-	NodeVMCount := make(map[string]int)
-	for _, vm := range vml.VMs {
-		NodeVMCount[vm.Node]++
-	}
+	minCount := vml.NodeVMCount[minNode]
 
 	for _, node := range vml.Nodes {
-		count := NodeVMCount[node]
+		count := vml.NodeVMCount[node]
 		if count < minCount {
 			minCount = count
 			minNode = node
@@ -153,12 +155,14 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 		RPCPort:        resp.RpcPort,
 		Node:           minNode,
 		LastTimeUsedMs: time.Now().UnixMilli(),
+		RetryCount:     0,
 	}
 
 	vml.Lock.Lock()
 	defer vml.Lock.Unlock()
 
-	vml.VMs = append(vml.VMs, newVM)
+	// vml.VMs = append(vml.VMs, newVM)
+	vml.NodeVMCount[minNode]++
 	vml.logger.Infof("khala: created VM: %v", newVM)
 
 	return newVM, nil
@@ -185,20 +189,28 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 					keptVMsByNode := make([]*VMMetadata, 0)
 					vmsToRemove := make([]*VMMetadata, 0)
 
-					// Iterate through each node's VM list in the map.
+					TotalVMs := 0
+					for _, count := range vml.NodeVMCount {
+						TotalVMs += count
+					}
+
 					for _, vm := range vml.VMs {
 						if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
 							vmsToRemove = append(vmsToRemove, vm)
+							vml.NodeVMCount[vm.Node]--
 						} else {
 							keptVMsByNode = append(keptVMsByNode, vm)
 						}
 					}
 
 					vml.VMs = keptVMsByNode
-
-					vml.logger.Infof("khala: workload %s cleaned up %s / %s, current VMs: %d", vml.Workload, len(vmsToRemove), len(vmsToRemove)+len(keptVMsByNode), len(keptVMsByNode))
+					vmsToRemoveCount := len(vmsToRemove)
 
 					vml.Lock.Unlock()
+
+					if vmsToRemoveCount > 0 {
+						vml.logger.Infof("khala: workload %s cleaned up %d / %d", vml.Workload, vmsToRemoveCount, TotalVMs)
+					}
 
 					if len(vmsToRemove) > 0 {
 						var wg sync.WaitGroup
@@ -221,4 +233,28 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 			}
 		}()
 	})
+}
+
+func (vml *VMList) InvalidateVM(vm *VMMetadata) {
+	vml.logger.Infof("khala: vm failed to serve request, invalidating VM: %v", vm)
+	if vm.RetryCount < 3 {
+		vm.RetryCount++
+		vml.logger.Debugf("khala: VM %s retry count increased to %d", vm.ID, vm.RetryCount)
+		vml.PushVM(vm, false)
+	} else {
+		go func() {
+			vml.Lock.Lock()
+			vml.NodeVMCount[vm.Node]--
+			client, ok := vml.khalaGrpcClient[vm.Node]
+			if !ok {
+				vml.Lock.Unlock()
+				vml.logger.Errorf("gRPC client not found for node %s", vm.Node)
+				return
+			}
+			vml.Lock.Unlock()
+
+			client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vm.ID})
+			vml.logger.Infof("khala: invalidated VM: %v", vm)
+		}()
+	}
 }

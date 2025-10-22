@@ -171,7 +171,6 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	nodes  []string
 	vmList *activator.VMList
 }
 
@@ -250,10 +249,13 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	}
 
 	defer func() {
-		// Push the VM back to the stack after use
-		rt.vmList.PushVM(vm)
+		if ret != nil {
+			rt.vmList.InvalidateVM(vm)
+		} else {
+			rt.vmList.PushVM(vm, true)
+		}
 	}()
-
+	
 	ret = function(vm.Node + ":" + vm.RPCPort)
 
 	return ret
