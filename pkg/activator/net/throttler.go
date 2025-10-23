@@ -20,6 +20,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 
 	"go.uber.org/atomic"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	corev1 "k8s.io/api/core/v1"
+
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,6 +45,7 @@ import (
 	"knative.dev/pkg/logging/logkey"
 	"knative.dev/pkg/reconciler"
 	"knative.dev/serving/pkg/activator"
+	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
@@ -178,6 +181,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 	containerConcurrency int, proto string,
 	breakerParams queue.BreakerParams,
 	nodes []string,
+	annotations map[string]string,
 	logger *zap.SugaredLogger) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
@@ -197,11 +201,15 @@ func newRevisionThrottler(revID types.NamespacedName,
 		revBreaker = queue.NewBreaker(breakerParams)
 		lbp = newRoundRobinPolicy()
 	}
+
+	// get revision scale info: minScale, maxScale, initialScale
+	revScale := getRevScale(annotations, logger)
+
 	extractedName := activator.ExtractName(revID.String())
 	logger.Debugf("khala: extracted revID: %s", extractedName)
 
-	vmList := activator.NewRevVMList(extractedName, nodes, logger)
-
+	vmList := activator.NewRevVMList(extractedName, nodes, revScale, logger)
+	vmList.InitialScaleUp()
 	vmList.RemoveVMsWithLeastRecentUse(context.Background())
 	return &revisionThrottler{
 		revID:                revID,
@@ -213,6 +221,27 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		vmList:               vmList,
 	}
+}
+
+func getRevScale(annotations map[string]string, logger *zap.SugaredLogger) activator.RevisionScaleInfo {
+	scaleInfo := &activator.RevisionScaleInfo{}
+
+	if val, ok := annotations[autoscaling.MinScaleAnnotationKey]; ok {
+		scaleInfo.MinScale, _ = strconv.Atoi(val)
+	}
+
+	if val, ok := annotations[autoscaling.MaxScaleAnnotationKey]; ok {
+		scaleInfo.MaxScale, _ = strconv.Atoi(val)
+	}
+
+	if val, ok := annotations[autoscaling.InitialScaleAnnotationKey]; ok {
+		scaleInfo.InitialScale, _ = strconv.Atoi(val)
+	}
+
+	logger.Infof("khala: revision scale info - min: %d, max: %d, initial: %d",
+		scaleInfo.MinScale, scaleInfo.MaxScale, scaleInfo.InitialScale)
+
+	return *scaleInfo
 }
 
 func noop() {}
@@ -608,6 +637,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			pkgnet.ServicePortName(rev.GetProtocol()),
 			queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: revisionMaxConcurrency},
 			t.nodes,
+			rev.GetAnnotations(),
 			t.logger,
 		)
 		t.revisionThrottlers[revID] = revThrottler

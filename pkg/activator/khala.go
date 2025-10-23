@@ -23,6 +23,12 @@ type VMMetadata struct {
 	RetryCount     int
 }
 
+type RevisionScaleInfo struct {
+	MinScale     int
+	MaxScale     int
+	InitialScale int
+}
+
 type VMList struct {
 	// UPDATED: Changed from a flat slice to a map of slices, keyed by node name.
 	VMs                  []*VMMetadata
@@ -36,10 +42,17 @@ type VMList struct {
 	Lock                 sync.RWMutex
 	logger               *zap.SugaredLogger
 	runClenaupOnce       sync.Once
+	noColdStart          bool
+	revScale             RevisionScaleInfo
 }
 
-func NewRevVMList(extractedName string, nodes []string, logger *zap.SugaredLogger) *VMList {
+func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger) *VMList {
 	logger.Infof("khala: initializing VMList with nodes: %v", nodes)
+	// We support no-coldstart mode for testing purposes
+	// In general, we use Initscale to we pre-create VMs up to the initial scale
+	// and never scale down - not running RemoveVMsWithLeastRecentUse
+
+	ColdStart := GetBoolEnv("NO_COLDSTART", false)
 	keepAlive := GetEnv("KEEPALIVE_DURATION", 60)
 	updateInt := GetEnv("UPDATE_INTERVAL", 5)
 	logger.Infof("khala: keepalive duration: %v", keepAlive)
@@ -56,8 +69,11 @@ func NewRevVMList(extractedName string, nodes []string, logger *zap.SugaredLogge
 		khalaGrpcClient[node] = khala.NewKhalaKnativeIntegrationClient(orchestratorConn)
 	}
 
-	// Initialize the map and pre-allocate a slice for each node.
-	VMs := make([]*VMMetadata, 0)
+	initialCap := revScale.InitialScale
+	if initialCap < 1 {
+		initialCap = 1
+	}
+	VMs := make([]*VMMetadata, 0, initialCap)
 
 	NodeVMCount := make(map[string]int)
 	for _, node := range nodes {
@@ -75,6 +91,8 @@ func NewRevVMList(extractedName string, nodes []string, logger *zap.SugaredLogge
 		updateIntervalSec:    updateInt,
 		logger:               logger,
 		runClenaupOnce:       sync.Once{},
+		noColdStart:          ColdStart,
+		revScale:             revScale,
 	}
 }
 
@@ -168,11 +186,44 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 	return newVM, nil
 }
 
+func (vml *VMList) InitialScaleUp() {
+	if vml.revScale.InitialScale <= 0 {
+		return
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(vml.revScale.InitialScale)
+	concurrencyLimiter := make(chan struct{}, 5)
+
+	for i := 0; i < vml.revScale.InitialScale; i++ {
+		concurrencyLimiter <- struct{}{}
+		go func(idx int) {
+			defer wg.Done()
+			vm, err := vml.CreateVM()
+			if err != nil {
+				vml.logger.Errorf("khala: failed to create VM during initial scale-up: %v", err)
+				<-concurrencyLimiter
+				return
+			}
+			vml.PushVM(vm, true)
+			<-concurrencyLimiter
+			vml.logger.Debugf("khala: initial scale-up created VM %s", vm.ID)
+		}(i)
+	}
+	wg.Wait()
+
+	vml.logger.Infof("khala: completed initial scale-up for workload %s", vml.Workload)
+}
+
 // Periodically removes VMs that have not been used recently.
 func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 	// ensure this goroutine runs only once
 	vml.runClenaupOnce.Do(func() {
 		go func() {
+			if vml.noColdStart {
+				vml.logger.Infof("khala: no-coldstart mode enabled, skipping RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
+				return
+			}
 			vml.logger.Infof("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
 			ticker := time.NewTicker(time.Duration(vml.updateIntervalSec) * time.Second)
 			defer ticker.Stop()

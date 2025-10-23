@@ -17,6 +17,18 @@ func GetEnv(key string, fallback int) int {
 	return fallback
 }
 
+func GetBoolEnv(key string, fallback bool) bool {
+	if value, ok := os.LookupEnv(key); ok {
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return fallback
+		}
+		return b
+	}
+	return fallback
+}
+
+
 // Get the string representation of revID, e.g., "namespace/name-abc123"
 // "name" will refer to the workload name, hence will help to get the snapshot name to restore
 func ExtractName(fullName string) string {
