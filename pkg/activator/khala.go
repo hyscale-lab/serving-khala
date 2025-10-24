@@ -42,7 +42,7 @@ type VMList struct {
 	Lock                 sync.RWMutex
 	logger               *zap.SugaredLogger
 	runClenaupOnce       sync.Once
-	noColdStart          bool
+	NoScaleDown          bool
 	revScale             RevisionScaleInfo
 }
 
@@ -52,9 +52,10 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 	// In general, we use Initscale to we pre-create VMs up to the initial scale
 	// and never scale down - not running RemoveVMsWithLeastRecentUse
 
-	ColdStart := GetBoolEnv("NO_COLDSTART", false)
+	NoScaleDown := GetBoolEnv("NO_SCALEDOWN", false)
 	keepAlive := GetEnv("KEEPALIVE_DURATION", 60)
 	updateInt := GetEnv("UPDATE_INTERVAL", 5)
+	logger.Infof("khala: no-scale-down mode: %v", NoScaleDown)
 	logger.Infof("khala: keepalive duration: %v", keepAlive)
 	logger.Infof("khala: update interval: %v", updateInt)
 
@@ -91,7 +92,7 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		updateIntervalSec:    updateInt,
 		logger:               logger,
 		runClenaupOnce:       sync.Once{},
-		noColdStart:          ColdStart,
+		NoScaleDown:          NoScaleDown,
 		revScale:             revScale,
 	}
 }
@@ -199,6 +200,9 @@ func (vml *VMList) InitialScaleUp() {
 		concurrencyLimiter <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
+			// random sleep to avoid cohort creation
+			randGen := time.Now().UnixNano() % 100
+			time.Sleep(time.Duration(randGen) * time.Millisecond)
 			vm, err := vml.CreateVM()
 			if err != nil {
 				vml.logger.Errorf("khala: failed to create VM during initial scale-up: %v", err)
@@ -220,12 +224,15 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 	// ensure this goroutine runs only once
 	vml.runClenaupOnce.Do(func() {
 		go func() {
-			if vml.noColdStart {
-				vml.logger.Infof("khala: no-coldstart mode enabled, skipping RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
-				return
+			var ticker *time.Ticker
+			if vml.NoScaleDown {
+				vml.logger.Infof("khala: no-scaledown mode enabled, skipping RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
+				ticker = time.NewTicker(time.Duration(vml.updateIntervalSec * 4) * time.Second)
+			} else {
+				vml.logger.Infof("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
+				ticker = time.NewTicker(time.Duration(vml.updateIntervalSec) * time.Second)
 			}
-			vml.logger.Infof("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
-			ticker := time.NewTicker(time.Duration(vml.updateIntervalSec) * time.Second)
+
 			defer ticker.Stop()
 			// cancel for loop when ctx.Done is closed
 
@@ -236,49 +243,53 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 				case <-ticker.C:
 					currentTimeMs := time.Now().UnixMilli()
 					vml.Lock.Lock()
-
-					keptVMsByNode := make([]*VMMetadata, 0)
-					vmsToRemove := make([]*VMMetadata, 0)
-
 					TotalVMs := 0
 					for _, count := range vml.NodeVMCount {
 						TotalVMs += count
 					}
 
-					for _, vm := range vml.VMs {
-						if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
-							vmsToRemove = append(vmsToRemove, vm)
-							vml.NodeVMCount[vm.Node]--
-						} else {
-							keptVMsByNode = append(keptVMsByNode, vm)
-						}
-					}
+					if vml.NoScaleDown {
+						vml.Lock.Unlock()
+						vml.logger.Infof("khala: vm scale workload: %s, scale: %d, skipping scale down", vml.Workload, TotalVMs)
+					} else {
+						keptVMsByNode := make([]*VMMetadata, 0)
+						vmsToRemove := make([]*VMMetadata, 0)
 
-					vml.VMs = keptVMsByNode
-					vmsToRemoveCount := len(vmsToRemove)
-
-					vml.Lock.Unlock()
-
-					if vmsToRemoveCount > 0 {
-						vml.logger.Infof("khala: workload %s cleaned up %d / %d", vml.Workload, vmsToRemoveCount, TotalVMs)
-					}
-
-					if len(vmsToRemove) > 0 {
-						var wg sync.WaitGroup
-						for _, vm := range vmsToRemove {
-							client, ok := vml.khalaGrpcClient[vm.Node]
-							if !ok {
-								vml.logger.Errorf("gRPC client not found for node %s", vm.Node)
-								continue
+						for _, vm := range vml.VMs {
+							if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
+								vmsToRemove = append(vmsToRemove, vm)
+								vml.NodeVMCount[vm.Node]--
+							} else {
+								keptVMsByNode = append(keptVMsByNode, vm)
 							}
-							wg.Add(1)
-							go func(vmToRemove *VMMetadata, log *zap.SugaredLogger) {
-								defer wg.Done()
-								client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vmToRemove.ID})
-								log.Infof("khala: removed VM due to inactivity: %v", vmToRemove)
-							}(vm, vml.logger)
 						}
-						wg.Wait()
+
+						vml.VMs = keptVMsByNode
+						vmsToRemoveCount := len(vmsToRemove)
+
+						vml.Lock.Unlock()
+
+						if vmsToRemoveCount > 0 {
+							vml.logger.Infof("khala: workload %s cleaned up %d / %d", vml.Workload, vmsToRemoveCount, TotalVMs)
+						}
+
+						if len(vmsToRemove) > 0 {
+							var wg sync.WaitGroup
+							for _, vm := range vmsToRemove {
+								client, ok := vml.khalaGrpcClient[vm.Node]
+								if !ok {
+									vml.logger.Errorf("gRPC client not found for node %s", vm.Node)
+									continue
+								}
+								wg.Add(1)
+								go func(vmToRemove *VMMetadata, log *zap.SugaredLogger) {
+									defer wg.Done()
+									client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vmToRemove.ID})
+									log.Infof("khala: removed VM due to inactivity: %v", vmToRemove)
+								}(vm, vml.logger)
+							}
+							wg.Wait()
+						}
 					}
 				}
 			}

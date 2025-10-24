@@ -174,7 +174,8 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	vmList *activator.VMList
+	vmList      *activator.VMList
+	noScaleDown bool
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -220,6 +221,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
 		vmList:               vmList,
+		noScaleDown:          vmList.NoScaleDown,
 	}
 }
 
@@ -284,7 +286,7 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 			rt.vmList.PushVM(vm, true)
 		}
 	}()
-	
+
 	ret = function(vm.Node + ":" + vm.RPCPort)
 
 	return ret
