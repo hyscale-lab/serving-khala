@@ -35,6 +35,7 @@ type VMList struct {
 	Workload             string
 	Nodes                []string
 	NodeVMCount          map[string]int
+	TotalVMCount         int
 	nextNodeIndex        int
 	khalaGrpcClient      map[string]khala.KhalaKnativeIntegrationClient
 	keepaliveDurationSec int
@@ -145,6 +146,11 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 		return nil, fmt.Errorf("no nodes available to create a VM")
 	}
 
+	if vml.TotalVMCount >= vml.revScale.MaxScale {
+		vml.Lock.Unlock()
+		return nil, fmt.Errorf("maximum scale reached: %d", vml.revScale.MaxScale)
+	}
+
 	minNode := vml.Nodes[0]
 	minCount := vml.NodeVMCount[minNode]
 
@@ -182,6 +188,7 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 
 	// vml.VMs = append(vml.VMs, newVM)
 	vml.NodeVMCount[minNode]++
+	vml.TotalVMCount++
 	vml.logger.Infof("khala: created VM: %v", newVM)
 
 	return newVM, nil
@@ -227,7 +234,7 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 			var ticker *time.Ticker
 			if vml.NoScaleDown {
 				vml.logger.Infof("khala: no-scaledown mode enabled, skipping RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
-				ticker = time.NewTicker(time.Duration(vml.updateIntervalSec * 4) * time.Second)
+				ticker = time.NewTicker(time.Duration(vml.updateIntervalSec*4) * time.Second)
 			} else {
 				vml.logger.Infof("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
 				ticker = time.NewTicker(time.Duration(vml.updateIntervalSec) * time.Second)
@@ -259,6 +266,7 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 							if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
 								vmsToRemove = append(vmsToRemove, vm)
 								vml.NodeVMCount[vm.Node]--
+								vml.TotalVMCount--
 							} else {
 								keptVMsByNode = append(keptVMsByNode, vm)
 							}
@@ -307,6 +315,7 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 		go func() {
 			vml.Lock.Lock()
 			vml.NodeVMCount[vm.Node]--
+			vml.TotalVMCount--
 			client, ok := vml.khalaGrpcClient[vm.Node]
 			if !ok {
 				vml.Lock.Unlock()
