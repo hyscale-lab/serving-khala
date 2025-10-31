@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -272,7 +273,16 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 		rt.logger.Infof("khala: no available VM. creating a new one")
 		// No VM available, need to create a new one
 		// Create a new VM for this request
-		vm, err = rt.vmList.CreateVM()
+		// try create VM 3 times with exponential backoff 10ms and 100ms
+		var createAttempts int
+		for createAttempts = 0; createAttempts < 3; createAttempts++ {
+			vm, err = rt.vmList.CreateVM()
+			if err == nil {
+				break
+			}
+			rt.logger.Errorf("khala: failed to create VM: %v", err)
+			time.Sleep(time.Duration(10*(1<<createAttempts)) * time.Millisecond)
+		}
 		if err != nil {
 			rt.logger.Errorf("khala: failed to create VM: %v", err)
 			return err

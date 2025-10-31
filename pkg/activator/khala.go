@@ -314,8 +314,6 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 	} else {
 		go func() {
 			vml.Lock.Lock()
-			vml.NodeVMCount[vm.Node]--
-			vml.TotalVMCount--
 			client, ok := vml.khalaGrpcClient[vm.Node]
 			if !ok {
 				vml.Lock.Unlock()
@@ -323,8 +321,13 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 				return
 			}
 			vml.Lock.Unlock()
-
 			client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vm.ID})
+
+			vml.Lock.Lock()
+			vml.NodeVMCount[vm.Node]--
+			vml.TotalVMCount--
+			vml.Lock.Unlock()
+
 			vml.logger.Infof("khala: invalidated VM: %v", vm)
 		}()
 	}
