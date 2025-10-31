@@ -273,19 +273,21 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 		rt.logger.Infof("khala: no available VM. creating a new one")
 		// No VM available, need to create a new one
 		// Create a new VM for this request
-		// try create VM 3 times with exponential backoff 10ms and 100ms
-		var createAttempts int
-		for createAttempts = 0; createAttempts < 3; createAttempts++ {
-			vm, err = rt.vmList.CreateVM()
-			if err == nil {
+		// try create VM 5 times with exponential backoff 10 20 40 80 160 ms
+		for retryAttempts := 0; retryAttempts < 5; retryAttempts++ {
+			time.Sleep(time.Duration(10*(1<<retryAttempts)) * time.Millisecond)
+			vm = rt.vmList.PopVM()
+			if vm != nil {
 				break
 			}
 			rt.logger.Errorf("khala: failed to create VM: %v", err)
-			time.Sleep(time.Duration(10*(1<<createAttempts)) * time.Millisecond)
 		}
-		if err != nil {
-			rt.logger.Errorf("khala: failed to create VM: %v", err)
-			return err
+		if vm == nil {
+			vm, err = rt.vmList.CreateVM()
+			if err != nil {
+				rt.logger.Errorf("khala: failed to create VM: %v", err)
+				return err
+			}
 		}
 	}
 
