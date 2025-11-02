@@ -1,4 +1,4 @@
-package activator
+package khala
 
 import (
 	"os"
@@ -27,7 +27,6 @@ func GetBoolEnv(key string, fallback bool) bool {
 	}
 	return fallback
 }
-
 
 // Get the string representation of revID, e.g., "namespace/name-abc123"
 // "name" will refer to the workload name, hence will help to get the snapshot name to restore

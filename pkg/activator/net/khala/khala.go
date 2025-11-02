@@ -1,4 +1,4 @@
-package activator
+package khala
 
 import (
 	"context"
@@ -45,9 +45,10 @@ type VMList struct {
 	runClenaupOnce       sync.Once
 	NoScaleDown          bool
 	revScale             RevisionScaleInfo
+	CapacityUpdateFunc   func(int)
 }
 
-func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger) *VMList {
+func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger, capacityUpdateFunc func(int)) *VMList {
 	logger.Infof("khala: initializing VMList with nodes: %v", nodes)
 	// We support no-coldstart mode for testing purposes
 	// In general, we use Initscale to we pre-create VMs up to the initial scale
@@ -95,6 +96,7 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		runClenaupOnce:       sync.Once{},
 		NoScaleDown:          NoScaleDown,
 		revScale:             revScale,
+		CapacityUpdateFunc:   capacityUpdateFunc,
 	}
 }
 
@@ -146,7 +148,7 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 		return nil, fmt.Errorf("no nodes available to create a VM")
 	}
 
-	if vml.TotalVMCount >= vml.revScale.MaxScale {
+	if vml.revScale.MaxScale != 0 && vml.TotalVMCount >= vml.revScale.MaxScale {
 		vml.Lock.Unlock()
 		return nil, fmt.Errorf("maximum scale reached: %d", vml.revScale.MaxScale)
 	}
@@ -189,6 +191,9 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 	// vml.VMs = append(vml.VMs, newVM)
 	vml.NodeVMCount[minNode]++
 	vml.TotalVMCount++
+	if vml.CapacityUpdateFunc != nil {
+		vml.CapacityUpdateFunc(vml.TotalVMCount)
+	}
 	vml.logger.Infof("khala: created VM: %v", newVM)
 
 	return newVM, nil
@@ -267,9 +272,14 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 								vmsToRemove = append(vmsToRemove, vm)
 								vml.NodeVMCount[vm.Node]--
 								vml.TotalVMCount--
+
 							} else {
 								keptVMsByNode = append(keptVMsByNode, vm)
 							}
+						}
+
+						if vml.CapacityUpdateFunc != nil {
+							vml.CapacityUpdateFunc(vml.TotalVMCount)
 						}
 
 						vml.VMs = keptVMsByNode
@@ -326,6 +336,9 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 			vml.Lock.Lock()
 			vml.NodeVMCount[vm.Node]--
 			vml.TotalVMCount--
+			if vml.CapacityUpdateFunc != nil {
+				vml.CapacityUpdateFunc(vml.TotalVMCount)
+			}
 			vml.Lock.Unlock()
 
 			vml.logger.Infof("khala: invalidated VM: %v", vm)

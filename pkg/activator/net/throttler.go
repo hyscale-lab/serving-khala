@@ -45,7 +45,7 @@ import (
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/logging/logkey"
 	"knative.dev/pkg/reconciler"
-	"knative.dev/serving/pkg/activator"
+	"knative.dev/serving/pkg/activator/net/khala"
 	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
@@ -175,8 +175,12 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	vmList      *activator.VMList
-	noScaleDown bool
+	vmList       *khala.VMList
+	khalaBreaker breaker
+	noScaleDown  bool
+
+	// creatingVM is a flag to ensure we only have one VM creation in flight at a time.
+	creatingVM atomic.Bool
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -207,12 +211,19 @@ func newRevisionThrottler(revID types.NamespacedName,
 	// get revision scale info: minScale, maxScale, initialScale
 	revScale := getRevScale(annotations, logger)
 
-	extractedName := activator.ExtractName(revID.String())
+	extractedName := khala.ExtractName(revID.String())
 	logger.Debugf("khala: extracted revID: %s", extractedName)
 
-	vmList := activator.NewRevVMList(extractedName, nodes, revScale, logger)
+	khalaBreakerParams := queue.BreakerParams{
+		QueueDepth:      breakerQueueDepth,
+		MaxConcurrency:  revScale.MaxScale,
+		InitialCapacity: revScale.InitialScale,
+	}
+	khalaBreaker := queue.NewBreaker(khalaBreakerParams)
+	vmList := khala.NewRevVMList(extractedName, nodes, revScale, logger, khalaBreaker.UpdateConcurrency)
 	vmList.InitialScaleUp()
 	vmList.RemoveVMsWithLeastRecentUse(context.Background())
+
 	return &revisionThrottler{
 		revID:                revID,
 		containerConcurrency: containerConcurrency,
@@ -222,12 +233,13 @@ func newRevisionThrottler(revID types.NamespacedName,
 		activatorIndex:       *atomic.NewInt32(-1), // Start with unknown.
 		lbPolicy:             lbp,
 		vmList:               vmList,
+		khalaBreaker:         khalaBreaker,
 		noScaleDown:          vmList.NoScaleDown,
 	}
 }
 
-func getRevScale(annotations map[string]string, logger *zap.SugaredLogger) activator.RevisionScaleInfo {
-	scaleInfo := &activator.RevisionScaleInfo{}
+func getRevScale(annotations map[string]string, logger *zap.SugaredLogger) khala.RevisionScaleInfo {
+	scaleInfo := &khala.RevisionScaleInfo{}
 
 	if val, ok := annotations[autoscaling.MinScaleAnnotationKey]; ok {
 		scaleInfo.MinScale, _ = strconv.Atoi(val)
@@ -261,46 +273,59 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 	return rt.lbPolicy(ctx, rt.assignedTrackers)
 }
 
-// baseline version
+// queue up request for each revision throttler.
+// reuse breaker used in baseline.
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
 	var ret error
-	var err error
-	var vm *activator.VMMetadata
 
-	// Pop out a VM for this request
-	vm = rt.vmList.PopVM()
-	if vm == nil {
-		rt.logger.Infof("khala: no available VM. creating a new one")
-		// No VM available, need to create a new one
-		// Create a new VM for this request
-		// try create VM 5 times with exponential backoff 10 20 40 80 160 ms
-		for retryAttempts := 0; retryAttempts < 5; retryAttempts++ {
-			time.Sleep(time.Duration(10*(1<<retryAttempts)) * time.Millisecond)
+	// Use the khalaBreaker, which is sized based on the number of VMs.
+	err := rt.khalaBreaker.Maybe(ctx, func() {
+		var vm *khala.VMMetadata
+
+		for {
+			// Attempt to get an available VM.
 			vm = rt.vmList.PopVM()
 			if vm != nil {
 				break
 			}
-			rt.logger.Errorf("khala: failed to create VM: %v", err)
-		}
-		if vm == nil {
-			vm, err = rt.vmList.CreateVM()
-			if err != nil {
-				rt.logger.Errorf("khala: failed to create VM: %v", err)
-				return err
+
+			// If no VM is available, ensure a creation is in flight.
+			if !rt.creatingVM.Load() {
+				rt.creatingVM.Store(true)
+				go func() {
+					defer rt.creatingVM.Store(false)
+					newVM, err := rt.vmList.CreateVM()
+					if err != nil {
+						rt.logger.Errorf("khala: failed to create VM: %v", err)
+						return
+					}
+					rt.vmList.PushVM(newVM, true)
+				}()
+			}
+
+			// Wait for a VM to become available.
+			select {
+			case <-ctx.Done(): // The request timed out.
+				ret = ctx.Err()
+				return
+			case <-time.After(1 * time.Millisecond): // Wait a short moment before retrying PopVM.
 			}
 		}
+
+		// Once we have a VM, execute the function.
+		defer func() {
+			if ret != nil {
+				rt.vmList.InvalidateVM(vm)
+			} else {
+				rt.vmList.PushVM(vm, true)
+			}
+		}()
+		ret = function(vm.Node + ":" + vm.RPCPort)
+	})
+
+	if err != nil {
+		return err
 	}
-
-	defer func() {
-		if ret != nil {
-			rt.vmList.InvalidateVM(vm)
-		} else {
-			rt.vmList.PushVM(vm, true)
-		}
-	}()
-
-	ret = function(vm.Node + ":" + vm.RPCPort)
-
 	return ret
 }
 
