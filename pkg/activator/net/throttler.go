@@ -22,10 +22,10 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	corev1 "k8s.io/api/core/v1"
@@ -180,7 +180,7 @@ type revisionThrottler struct {
 	noScaleDown  bool
 
 	// creatingVM is a flag to ensure we only have one VM creation in flight at a time.
-	creatingVM atomic.Bool
+	creatingVM semaphore.Weighted
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -235,6 +235,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		vmList:               vmList,
 		khalaBreaker:         khalaBreaker,
 		noScaleDown:          vmList.NoScaleDown,
+		creatingVM:           *semaphore.NewWeighted(int64(5 * len(nodes))),
 	}
 }
 
@@ -278,53 +279,41 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
 	var ret error
 
-	// Use the khalaBreaker, which is sized based on the number of VMs.
-	err := rt.khalaBreaker.Maybe(ctx, func() {
-		var vm *khala.VMMetadata
-
-		for {
-			// Attempt to get an available VM.
-			vm = rt.vmList.PopVM()
-			if vm != nil {
-				break
-			}
-
-			// If no VM is available, ensure a creation is in flight.
-			if !rt.creatingVM.Load() {
-				rt.creatingVM.Store(true)
-				go func() {
-					defer rt.creatingVM.Store(false)
-					newVM, err := rt.vmList.CreateVM()
-					if err != nil {
-						rt.logger.Errorf("khala: failed to create VM: %v", err)
-						return
-					}
-					rt.vmList.PushVM(newVM, true)
-				}()
-			}
-
-			// Wait for a VM to become available.
-			select {
-			case <-ctx.Done(): // The request timed out.
-				ret = ctx.Err()
+	reenqueue := true
+	for reenqueue {
+		reenqueue = false
+		if err := rt.khalaBreaker.Maybe(ctx, func() {
+			vm := rt.vmList.PopVM()
+			if vm == nil {
+				reenqueue = true
+				// trigger createVM in background
+				// if creatingVM > 0
+				if rt.creatingVM.TryAcquire(1) {
+					go func() {
+						defer rt.creatingVM.Release(1)
+						newVM, err := rt.vmList.CreateVM()
+						if err != nil {
+							rt.logger.Errorf("Failed to create VM: %v", err)
+							return
+						}
+						rt.logger.Infof("Created new VM: %v", newVM)
+					}()
+				}
 				return
-			case <-time.After(1 * time.Millisecond): // Wait a short moment before retrying PopVM.
 			}
+
+			defer func() {
+				if ret != nil {
+					rt.vmList.InvalidateVM(vm)
+				} else {
+					rt.vmList.PushVM(vm, true)
+				}
+			}()
+
+			ret = function(vm.Node + ":" + vm.RPCPort)
+		}); err != nil {
+			return err
 		}
-
-		// Once we have a VM, execute the function.
-		defer func() {
-			if ret != nil {
-				rt.vmList.InvalidateVM(vm)
-			} else {
-				rt.vmList.PushVM(vm, true)
-			}
-		}()
-		ret = function(vm.Node + ":" + vm.RPCPort)
-	})
-
-	if err != nil {
-		return err
 	}
 	return ret
 }

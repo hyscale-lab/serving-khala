@@ -106,16 +106,18 @@ package net
 // func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
 // 	var ret error
 
+// 	// Use the khalaBreaker, which is sized based on the number of VMs.
 // 	err := rt.khalaBreaker.Maybe(ctx, func() {
 // 		var vm *khala.VMMetadata
+
 // 		for {
-// 			// First, try to get an available VM.
+// 			// Attempt to get an available VM.
 // 			vm = rt.vmList.PopVM()
 // 			if vm != nil {
 // 				break
 // 			}
 
-// 			// If there are no VMs and we are not already creating one, trigger a creation.
+// 			// If no VM is available, ensure a creation is in flight.
 // 			if !rt.creatingVM.Load() {
 // 				rt.creatingVM.Store(true)
 // 				go func() {
@@ -131,11 +133,10 @@ package net
 
 // 			// Wait for a VM to become available.
 // 			select {
-// 			case <-ctx.Done():
+// 			case <-ctx.Done(): // The request timed out.
 // 				ret = ctx.Err()
 // 				return
-// 			case <-time.After(10 * time.Millisecond):
-// 				// Continue loop to try PopVM again.
+// 			case <-time.After(1 * time.Millisecond): // Wait a short moment before retrying PopVM.
 // 			}
 // 		}
 
