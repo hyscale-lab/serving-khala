@@ -25,7 +25,6 @@ import (
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
-	"golang.org/x/sync/semaphore"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	corev1 "k8s.io/api/core/v1"
@@ -177,9 +176,6 @@ type revisionThrottler struct {
 
 	vmList       *khala.VMList
 	khalaBreaker breaker
-
-	// creatingVM is a flag to ensure we only have one VM creation in flight at a time.
-	creatingVM semaphore.Weighted
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -213,13 +209,21 @@ func newRevisionThrottler(revID types.NamespacedName,
 	extractedName := khala.ExtractName(revID.String())
 	logger.Debugf("khala: extracted revID: %s", extractedName)
 
+	const scaleUpBufferSize = 2
+
 	khalaBreakerParams := queue.BreakerParams{
 		QueueDepth:      breakerQueueDepth,
 		MaxConcurrency:  revScale.MaxScale,
-		InitialCapacity: revScale.InitialScale,
+		InitialCapacity: min(revScale.InitialScale+scaleUpBufferSize, revScale.MaxScale),
 	}
 	khalaBreaker := queue.NewBreaker(khalaBreakerParams)
-	vmList := khala.NewRevVMList(extractedName, nodes, revScale, logger, khalaBreaker.UpdateConcurrency)
+
+	capacityUpdateFunc := func(currentVMCount int) {
+		bufferedCapacity := min(currentVMCount+scaleUpBufferSize, revScale.MaxScale)
+		khalaBreaker.UpdateConcurrency(bufferedCapacity)
+	}
+
+	vmList := khala.NewRevVMList(extractedName, nodes, revScale, logger, capacityUpdateFunc)
 	go vmList.InitialScaleUp()
 	vmList.RemoveVMsWithLeastRecentUse(context.Background())
 
@@ -233,7 +237,6 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		vmList:               vmList,
 		khalaBreaker:         khalaBreaker,
-		creatingVM:           *semaphore.NewWeighted(int64(5 * len(nodes))),
 	}
 }
 
@@ -288,41 +291,26 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
 	var ret error
 
-	reenqueue := true
-	for reenqueue {
-		reenqueue = false
-		if err := rt.khalaBreaker.Maybe(ctx, func() {
-			vm := rt.vmList.PopVM()
-			if vm == nil {
-				reenqueue = true
-				// trigger createVM in background
-				// if creatingVM > 0
-				if rt.creatingVM.TryAcquire(1) {
-					go func() {
-						defer rt.creatingVM.Release(1)
-						newVM, err := rt.vmList.CreateVM()
-						if err != nil {
-							rt.logger.Errorf("Failed to create VM: %v", err)
-							return
-						}
-						rt.logger.Infof("Created new VM: %v", newVM)
-					}()
-				}
-				return
-			}
-
-			defer func() {
-				if ret != nil {
-					rt.vmList.InvalidateVM(vm)
-				} else {
-					rt.vmList.PushVM(vm, true)
-				}
-			}()
-
-			ret = function(vm.Node + ":" + vm.RPCPort)
-		}); err != nil {
-			return err
+	if err := rt.khalaBreaker.Maybe(ctx, func() {
+		release, vm := rt.vmList.AcquireVM(ctx)
+		if vm == nil {
+			// This means the context timed out.
+			ret = ctx.Err()
+			return
 		}
+
+		defer func() {
+			if ret != nil {
+				rt.vmList.InvalidateVM(vm)
+			} else {
+				// Release the VM back to the pool on success.
+				release()
+			}
+		}()
+
+		ret = function(vm.Node + ":" + vm.RPCPort)
+	}); err != nil {
+		return err
 	}
 	return ret
 }

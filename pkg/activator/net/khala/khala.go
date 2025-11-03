@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	khala "knative.dev/serving/pkg/proto"
@@ -45,6 +46,8 @@ type VMList struct {
 	runClenaupOnce       sync.Once
 	revScale             RevisionScaleInfo
 	CapacityUpdateFunc   func(int)
+	creatingVM           *semaphore.Weighted
+	vmAvailableChan      chan struct{}
 }
 
 func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger, capacityUpdateFunc func(int)) *VMList {
@@ -90,6 +93,47 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		runClenaupOnce:       sync.Once{},
 		revScale:             revScale,
 		CapacityUpdateFunc:   capacityUpdateFunc,
+		creatingVM:           semaphore.NewWeighted(int64(5 * len(nodes))),
+		vmAvailableChan:      make(chan struct{}),
+	}
+}
+
+// AcquireVM waits for and returns an available VM.
+func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
+	for {
+		// First, try to get a VM without waiting.
+		vm := vml.PopVM()
+		if vm != nil {
+			release := func() { vml.PushVM(vm, true) }
+			return release, vm
+		}
+
+		// If no VM, get a reference to the current signal channel before waiting.
+		vml.Lock.RLock()
+		waitChan := vml.vmAvailableChan
+		vml.Lock.RUnlock()
+
+		// Try to kick off a creation if capacity allows.
+		if vml.creatingVM.TryAcquire(1) {
+			go func() {
+				defer vml.creatingVM.Release(1)
+				newVM, err := vml.CreateVM()
+				if err != nil {
+					vml.logger.Errorf("Failed to create VM: %v", err)
+					return
+				}
+				vml.logger.Infof("Created new VM: %v", newVM)
+				vml.PushVM(newVM, true) // This will signal the channel
+			}()
+		}
+
+		// Wait for either the context to be done or a VM to be pushed.
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		case <-waitChan:
+			// A VM was pushed. Loop again to try and pop it.
+		}
 	}
 }
 
@@ -126,10 +170,13 @@ func (vml *VMList) PushVM(vm *VMMetadata, resetRetryCount bool) {
 	if resetRetryCount {
 		vm.RetryCount = 0
 	}
-	node := vm.Node
 	vml.VMs = append(vml.VMs, vm)
+	vml.logger.Debugf("khala: pushed VM %s", vm.ID)
 
-	vml.logger.Debugf("khala: pushed VM %s back to node %s", vm.ID, node)
+	// Signal that a VM is available by closing the current channel
+	// and creating a new one. This acts as a broadcast to all waiters.
+	close(vml.vmAvailableChan)
+	vml.vmAvailableChan = make(chan struct{})
 }
 
 // CreateVM creates a new VM on the node with the fewest active VMs.
