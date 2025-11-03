@@ -43,21 +43,15 @@ type VMList struct {
 	Lock                 sync.RWMutex
 	logger               *zap.SugaredLogger
 	runClenaupOnce       sync.Once
-	NoScaleDown          bool
 	revScale             RevisionScaleInfo
 	CapacityUpdateFunc   func(int)
 }
 
 func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger, capacityUpdateFunc func(int)) *VMList {
 	logger.Infof("khala: initializing VMList with nodes: %v", nodes)
-	// We support no-coldstart mode for testing purposes
-	// In general, we use Initscale to we pre-create VMs up to the initial scale
-	// and never scale down - not running RemoveVMsWithLeastRecentUse
 
-	NoScaleDown := GetBoolEnv("NO_SCALEDOWN", false)
 	keepAlive := GetEnv("KEEPALIVE_DURATION", 60)
 	updateInt := GetEnv("UPDATE_INTERVAL", 5)
-	logger.Infof("khala: no-scale-down mode: %v", NoScaleDown)
 	logger.Infof("khala: keepalive duration: %v", keepAlive)
 	logger.Infof("khala: update interval: %v", updateInt)
 
@@ -94,7 +88,6 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		updateIntervalSec:    updateInt,
 		logger:               logger,
 		runClenaupOnce:       sync.Once{},
-		NoScaleDown:          NoScaleDown,
 		revScale:             revScale,
 		CapacityUpdateFunc:   capacityUpdateFunc,
 	}
@@ -234,7 +227,7 @@ func (vml *VMList) InitialScaleUp() {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(4*time.Second + time.Duration(time.Now().UnixNano()%2000)*time.Millisecond):
+				case <-time.After(1*time.Second + time.Duration(time.Now().UnixNano()%2000)*time.Millisecond):
 				}
 			}
 		}()
@@ -250,13 +243,9 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 	vml.runClenaupOnce.Do(func() {
 		go func() {
 			var ticker *time.Ticker
-			if vml.NoScaleDown {
-				vml.logger.Infof("khala: no-scaledown mode enabled, skipping RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
-				ticker = time.NewTicker(time.Duration(vml.updateIntervalSec*4) * time.Second)
-			} else {
-				vml.logger.Infof("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
-				ticker = time.NewTicker(time.Duration(vml.updateIntervalSec) * time.Second)
-			}
+
+			vml.logger.Infof("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
+			ticker = time.NewTicker(time.Duration(vml.updateIntervalSec) * time.Second)
 
 			defer ticker.Stop()
 			// cancel for loop when ctx.Done is closed
@@ -273,15 +262,16 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 						TotalVMs += count
 					}
 
-					if vml.NoScaleDown {
-						vml.Lock.Unlock()
-						vml.logger.Infof("khala: vm scale workload: %s, scale: %d, skipping scale down", vml.Workload, TotalVMs)
-					} else {
+					{
 						keptVMsByNode := make([]*VMMetadata, 0)
 						vmsToRemove := make([]*VMMetadata, 0)
 
 						for _, vm := range vml.VMs {
 							if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
+								if vml.revScale.MinScale > 0 && vml.TotalVMCount <= vml.revScale.MinScale {
+									keptVMsByNode = append(keptVMsByNode, vm)
+									continue
+								}
 								vmsToRemove = append(vmsToRemove, vm)
 								vml.NodeVMCount[vm.Node]--
 								vml.TotalVMCount--

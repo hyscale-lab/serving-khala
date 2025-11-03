@@ -46,7 +46,7 @@ import (
 	"knative.dev/pkg/logging/logkey"
 	"knative.dev/pkg/reconciler"
 	"knative.dev/serving/pkg/activator/net/khala"
-	"knative.dev/serving/pkg/apis/autoscaling"
+	khalaapis "knative.dev/serving/pkg/apis/khala"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
@@ -177,7 +177,6 @@ type revisionThrottler struct {
 
 	vmList       *khala.VMList
 	khalaBreaker breaker
-	noScaleDown  bool
 
 	// creatingVM is a flag to ensure we only have one VM creation in flight at a time.
 	creatingVM semaphore.Weighted
@@ -221,7 +220,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 	}
 	khalaBreaker := queue.NewBreaker(khalaBreakerParams)
 	vmList := khala.NewRevVMList(extractedName, nodes, revScale, logger, khalaBreaker.UpdateConcurrency)
-	vmList.InitialScaleUp()
+	go vmList.InitialScaleUp()
 	vmList.RemoveVMsWithLeastRecentUse(context.Background())
 
 	return &revisionThrottler{
@@ -234,7 +233,6 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		vmList:               vmList,
 		khalaBreaker:         khalaBreaker,
-		noScaleDown:          vmList.NoScaleDown,
 		creatingVM:           *semaphore.NewWeighted(int64(5 * len(nodes))),
 	}
 }
@@ -242,17 +240,28 @@ func newRevisionThrottler(revID types.NamespacedName,
 func getRevScale(annotations map[string]string, logger *zap.SugaredLogger) khala.RevisionScaleInfo {
 	scaleInfo := &khala.RevisionScaleInfo{}
 
-	if val, ok := annotations[autoscaling.MinScaleAnnotationKey]; ok {
+	// Prioritize Khala annotations
+	if val, ok := annotations[khalaapis.KhalaMinScaleAnnotationKey]; ok {
 		scaleInfo.MinScale, _ = strconv.Atoi(val)
 	}
 
-	if val, ok := annotations[autoscaling.MaxScaleAnnotationKey]; ok {
+	if val, ok := annotations[khalaapis.KhalaMaxScaleAnnotationKey]; ok {
 		scaleInfo.MaxScale, _ = strconv.Atoi(val)
 	}
 
-	if val, ok := annotations[autoscaling.InitialScaleAnnotationKey]; ok {
+	if val, ok := annotations[khalaapis.KhalaInitialScaleAnnotationKey]; ok {
 		scaleInfo.InitialScale, _ = strconv.Atoi(val)
 	}
+
+	// if val, ok := annotations[autoscaling.MinScaleAnnotationKey]; ok {
+	// 	scaleInfo.MinScale, _ = strconv.Atoi(val)
+	// }
+	// if val, ok := annotations[autoscaling.MaxScaleAnnotationKey]; ok {
+	// 	scaleInfo.MaxScale, _ = strconv.Atoi(val)
+	// }
+	// if val, ok := annotations[autoscaling.InitialScaleAnnotationKey]; ok {
+	// 	scaleInfo.InitialScale, _ = strconv.Atoi(val)
+	// }
 
 	logger.Infof("khala: revision scale info - min: %d, max: %d, initial: %d",
 		scaleInfo.MinScale, scaleInfo.MaxScale, scaleInfo.InitialScale)
