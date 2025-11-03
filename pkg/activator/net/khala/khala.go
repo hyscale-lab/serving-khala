@@ -203,31 +203,44 @@ func (vml *VMList) InitialScaleUp() {
 	if vml.revScale.InitialScale <= 0 {
 		return
 	}
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
 
-	wg := sync.WaitGroup{}
-	wg.Add(vml.revScale.InitialScale)
 	concurrencyLimiter := make(chan struct{}, 5)
 
+	var wg sync.WaitGroup
 	for i := 0; i < vml.revScale.InitialScale; i++ {
+		wg.Add(1)
 		concurrencyLimiter <- struct{}{}
-		go func(idx int) {
+		go func() {
 			defer wg.Done()
-			// random sleep to avoid cohort creation
-			randGen := time.Now().UnixNano() % 100
-			time.Sleep(time.Duration(randGen) * time.Millisecond)
-			vm, err := vml.CreateVM()
-			if err != nil {
-				vml.logger.Errorf("khala: failed to create VM during initial scale-up: %v", err)
-				<-concurrencyLimiter
-				return
-			}
-			vml.PushVM(vm, true)
-			<-concurrencyLimiter
-			vml.logger.Debugf("khala: initial scale-up created VM %s", vm.ID)
-		}(i)
-	}
-	wg.Wait()
+			defer func() { <-concurrencyLimiter }()
 
+			for {
+				if ctx.Err() != nil {
+					vml.logger.Errorf("khala: context deadline exceeded, stopping VM creation")
+					return
+				}
+
+				vm, err := vml.CreateVM()
+				if err == nil {
+					vml.PushVM(vm, true)
+					return
+				}
+
+				vml.logger.Warnf("khala: failed to create VM: %v, retrying in 2-3s", err)
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(4*time.Second + time.Duration(time.Now().UnixNano()%2000)*time.Millisecond):
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 	vml.logger.Infof("khala: completed initial scale-up for workload %s", vml.Workload)
 }
 
