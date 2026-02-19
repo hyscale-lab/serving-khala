@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	khala "knative.dev/serving/pkg/proto"
@@ -45,12 +44,10 @@ type VMList struct {
 	logger               *zap.SugaredLogger
 	runClenaupOnce       sync.Once
 	revScale             RevisionScaleInfo
-	CapacityUpdateFunc   func(int)
-	creatingVM           *semaphore.Weighted
 	vmAvailableChan      chan struct{}
 }
 
-func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger, capacityUpdateFunc func(int)) *VMList {
+func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger) *VMList {
 	logger.Infof("khala: initializing VMList with nodes: %v", nodes)
 
 	keepAlive := GetEnv("KEEPALIVE_DURATION", 60)
@@ -73,6 +70,10 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 	if initialCap < 1 {
 		initialCap = 1
 	}
+	chanBuf := revScale.MaxScale
+	if chanBuf < 1 {
+		chanBuf = 1
+	}
 	VMs := make([]*VMMetadata, 0, initialCap)
 
 	NodeVMCount := make(map[string]int)
@@ -92,47 +93,49 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		logger:               logger,
 		runClenaupOnce:       sync.Once{},
 		revScale:             revScale,
-		CapacityUpdateFunc:   capacityUpdateFunc,
-		creatingVM:           semaphore.NewWeighted(int64(5 * len(nodes))),
-		vmAvailableChan:      make(chan struct{}),
+		vmAvailableChan:      make(chan struct{}, chanBuf),
 	}
 }
 
-// AcquireVM waits for and returns an available VM.
+// AcquireVM returns an available VM, creating one inline if none exists (Lambda model).
+// Each request is its own VM allocation agent: it checks the MRU pool, and if
+// empty and below MaxScale, blocks directly on the gRPC CreateVM call.
+// At MaxScale it queues on vmAvailableChan waiting for a PushVM signal.
 func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
 	for {
-		// First, try to get a VM without waiting.
-		vm := vml.PopVM()
-		if vm != nil {
-			release := func() { vml.PushVM(vm, true) }
-			return release, vm
+		// 1. Try to get an idle VM from the MRU pool.
+		if vm := vml.PopVM(); vm != nil {
+			return func() { vml.PushVM(vm, true) }, vm
 		}
 
-		// If no VM, get a reference to the current signal channel before waiting.
+		// 2. Capture the wait channel before reading atMax to avoid missing
+		//    a PushVM signal that arrives between the atMax check and the select.
+		waitCh := vml.vmAvailableChan
+
 		vml.Lock.RLock()
-		waitChan := vml.vmAvailableChan
+		atMax := vml.revScale.MaxScale != 0 && vml.TotalVMCount >= vml.revScale.MaxScale
 		vml.Lock.RUnlock()
 
-		// Try to kick off a creation if capacity allows.
-		if vml.creatingVM.TryAcquire(1) {
-			go func() {
-				defer vml.creatingVM.Release(1)
-				newVM, err := vml.CreateVM()
-				if err != nil {
-					vml.logger.Errorf("Failed to create VM: %v", err)
-					return
-				}
-				vml.logger.Infof("Created new VM: %v", newVM)
-				vml.PushVM(newVM, true) // This will signal the channel
-			}()
+		if !atMax {
+			// 3. Below MaxScale: this goroutine creates the VM inline.
+			//    CreateVM atomically reserves a slot before making the gRPC call.
+			newVM, err := vml.CreateVM()
+			if err != nil {
+				vml.logger.Errorf("khala: failed to create VM: %v", err)
+				// Fall through to wait — another goroutine may succeed or a VM
+				// may be released before our context expires.
+			} else {
+				vml.logger.Infof("khala: created VM inline: %v", newVM)
+				return func() { vml.PushVM(newVM, true) }, newVM
+			}
 		}
 
-		// Wait for either the context to be done or a VM to be pushed.
+		// 4. At MaxScale (or creation failed): wait for a VM to be released.
 		select {
 		case <-ctx.Done():
 			return nil, nil
-		case <-waitChan:
-			// A VM was pushed. Loop again to try and pop it.
+		case <-waitCh:
+			// A VM was returned or a slot opened. Loop to try PopVM again.
 		}
 	}
 }
@@ -173,10 +176,18 @@ func (vml *VMList) PushVM(vm *VMMetadata, resetRetryCount bool) {
 	vml.VMs = append(vml.VMs, vm)
 	vml.logger.Debugf("khala: pushed VM %s", vm.ID)
 
-	// Signal that a VM is available by closing the current channel
-	// and creating a new one. This acts as a broadcast to all waiters.
-	close(vml.vmAvailableChan)
-	vml.vmAvailableChan = make(chan struct{})
+	// Signal exactly one waiter that a VM is available.
+	vml.signalWaiters()
+}
+
+// signalWaiters wakes one goroutine blocked in AcquireVM so it can
+// re-evaluate whether a VM is available or a creation slot has opened.
+// Safe to call without holding vml.Lock.
+func (vml *VMList) signalWaiters() {
+	select {
+	case vml.vmAvailableChan <- struct{}{}:
+	default:
+	}
 }
 
 // CreateVM creates a new VM on the node with the fewest active VMs.
@@ -209,10 +220,20 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 		vml.Lock.Unlock()
 		return nil, fmt.Errorf("gRPC client not found for node %s", minNode)
 	}
+
+	// Reserve the slot before releasing the lock so concurrent CreateVM
+	// calls see the updated count and don't exceed MaxScale.
+	vml.NodeVMCount[minNode]++
+	vml.TotalVMCount++
 	vml.Lock.Unlock()
 
 	resp, err := client.AddVM(context.Background(), &khala.AddVMRequest{VmName: vml.Workload})
 	if err != nil {
+		// Roll back the reservation on gRPC failure.
+		vml.Lock.Lock()
+		vml.NodeVMCount[minNode]--
+		vml.TotalVMCount--
+		vml.Lock.Unlock()
 		return nil, err
 	}
 
@@ -225,15 +246,6 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 		RetryCount:     0,
 	}
 
-	vml.Lock.Lock()
-	defer vml.Lock.Unlock()
-
-	// vml.VMs = append(vml.VMs, newVM)
-	vml.NodeVMCount[minNode]++
-	vml.TotalVMCount++
-	if vml.CapacityUpdateFunc != nil {
-		vml.CapacityUpdateFunc(vml.TotalVMCount)
-	}
 	vml.logger.Infof("khala: created VM: %v", newVM)
 
 	return newVM, nil
@@ -328,10 +340,6 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 							}
 						}
 
-						if vml.CapacityUpdateFunc != nil {
-							vml.CapacityUpdateFunc(vml.TotalVMCount)
-						}
-
 						vml.VMs = keptVMsByNode
 						vmsToRemoveCount := len(vmsToRemove)
 
@@ -386,11 +394,11 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 			vml.Lock.Lock()
 			vml.NodeVMCount[vm.Node]--
 			vml.TotalVMCount--
-			if vml.CapacityUpdateFunc != nil {
-				vml.CapacityUpdateFunc(vml.TotalVMCount)
-			}
 			vml.Lock.Unlock()
 
+			// A slot opened below MaxScale; wake one waiter so it can
+			// trigger CreateVM to replenish the pool.
+			vml.signalWaiters()
 			vml.logger.Infof("khala: invalidated VM: %v", vm)
 		}()
 	}

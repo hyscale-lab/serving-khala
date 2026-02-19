@@ -209,21 +209,16 @@ func newRevisionThrottler(revID types.NamespacedName,
 	extractedName := khala.ExtractName(revID.String())
 	logger.Debugf("khala: extracted revID: %s", extractedName)
 
-	const scaleUpBufferSize = 2
-
+	// All MaxScale slots are open from the start. The atMax guard inside
+	// AcquireVM enforces the hard ceiling — no ramping needed.
 	khalaBreakerParams := queue.BreakerParams{
 		QueueDepth:      breakerQueueDepth,
 		MaxConcurrency:  revScale.MaxScale,
-		InitialCapacity: min(revScale.InitialScale+scaleUpBufferSize, revScale.MaxScale),
+		InitialCapacity: revScale.MaxScale,
 	}
 	khalaBreaker := queue.NewBreaker(khalaBreakerParams)
 
-	capacityUpdateFunc := func(currentVMCount int) {
-		bufferedCapacity := min(currentVMCount+scaleUpBufferSize, revScale.MaxScale)
-		khalaBreaker.UpdateConcurrency(bufferedCapacity)
-	}
-
-	vmList := khala.NewRevVMList(extractedName, nodes, revScale, logger, capacityUpdateFunc)
+	vmList := khala.NewRevVMList(extractedName, nodes, revScale, logger)
 	go vmList.InitialScaleUp()
 	vmList.RemoveVMsWithLeastRecentUse(context.Background())
 
