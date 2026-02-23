@@ -295,10 +295,12 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 		}
 
 		defer func() {
-			if ret != nil {
+			if ret != nil && ctx.Err() == nil {
+				// Non-context error: the VM itself may be unhealthy, invalidate it.
 				rt.vmList.InvalidateVM(vm)
 			} else {
-				// Release the VM back to the pool on success.
+				// Either success, or the request's own deadline/cancellation caused
+				// the failure — the VM is healthy, return it to the pool.
 				release()
 			}
 		}()

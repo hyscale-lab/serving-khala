@@ -119,11 +119,22 @@ func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
 		if !atMax {
 			// 3. Below MaxScale: this goroutine creates the VM inline.
 			//    CreateVM atomically reserves a slot before making the gRPC call.
-			newVM, err := vml.CreateVM()
+			//    We pass ctx so the gRPC call is cancelled promptly if the request
+			//    times out, avoiding blocking this goroutine beyond its deadline.
+			newVM, err := vml.CreateVM(ctx)
 			if err != nil {
-				vml.logger.Errorf("khala: failed to create VM: %v", err)
+				if ctx.Err() != nil {
+					vml.logger.Warnf("khala: CreateVM cancelled by ctx (deadline exhausted during VM creation): %v", err)
+				} else {
+					vml.logger.Errorf("khala: failed to create VM: %v", err)
+				}
 				// Fall through to wait — another goroutine may succeed or a VM
 				// may be released before our context expires.
+			} else if ctx.Err() != nil {
+				// Context expired during creation. Push the VM back so a
+				// live request can use it instead of invalidating a healthy VM.
+				vml.PushVM(newVM, true)
+				return nil, nil
 			} else {
 				vml.logger.Infof("khala: created VM inline: %v", newVM)
 				return func() { vml.PushVM(newVM, true) }, newVM
@@ -191,7 +202,7 @@ func (vml *VMList) signalWaiters() {
 }
 
 // CreateVM creates a new VM on the node with the fewest active VMs.
-func (vml *VMList) CreateVM() (*VMMetadata, error) {
+func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 	vml.Lock.Lock()
 
 	if len(vml.Nodes) == 0 {
@@ -227,13 +238,15 @@ func (vml *VMList) CreateVM() (*VMMetadata, error) {
 	vml.TotalVMCount++
 	vml.Lock.Unlock()
 
-	resp, err := client.AddVM(context.Background(), &khala.AddVMRequest{VmName: vml.Workload})
+	resp, err := client.AddVM(ctx, &khala.AddVMRequest{VmName: vml.Workload})
 	if err != nil {
-		// Roll back the reservation on gRPC failure.
+		// Roll back the reservation on gRPC failure (includes ctx cancellation).
 		vml.Lock.Lock()
 		vml.NodeVMCount[minNode]--
 		vml.TotalVMCount--
 		vml.Lock.Unlock()
+		// Wake a waiter: TotalVMCount dropped, so atMax may now be false.
+		vml.signalWaiters()
 		return nil, err
 	}
 
@@ -275,7 +288,7 @@ func (vml *VMList) InitialScaleUp() {
 					return
 				}
 
-				vm, err := vml.CreateVM()
+				vm, err := vml.CreateVM(ctx)
 				if err == nil {
 					vml.PushVM(vm, true)
 					return
@@ -345,8 +358,10 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 
 						vml.Lock.Unlock()
 
+						// TotalVMCount dropped — wake one waiter so it can re-evaluate
+						// atMax and call CreateVM instead of sleeping until ctx deadline.
 						if vmsToRemoveCount > 0 {
-							vml.logger.Infof("khala: workload %s cleaned up %d / %d", vml.Workload, vmsToRemoveCount, TotalVMs)
+							vml.signalWaiters()
 						}
 
 						if len(vmsToRemove) > 0 {
