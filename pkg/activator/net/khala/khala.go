@@ -35,7 +35,9 @@ type VMList struct {
 	Workload             string
 	Nodes                []string
 	NodeVMCount          map[string]int
+	NodeCreateInFlight   map[string]int
 	TotalVMCount         int
+	CreateInFlight       int
 	nextNodeIndex        int
 	khalaGrpcClient      map[string]khala.KhalaKnativeIntegrationClient
 	keepaliveDurationSec int
@@ -45,15 +47,29 @@ type VMList struct {
 	runClenaupOnce       sync.Once
 	revScale             RevisionScaleInfo
 	vmAvailableChan      chan struct{}
+	createConcurrency    int
+	createPermits        chan struct{}
+	createTimeoutSec     int
+	warmBuffer           int
+	capacityUpdateFunc   func(int)
 }
 
-func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger) *VMList {
+func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger, capacityUpdateFunc func(int)) *VMList {
 	logger.Infof("khala: initializing VMList with nodes: %v", nodes)
 
 	keepAlive := GetEnv("KEEPALIVE_DURATION", 60)
 	updateInt := GetEnv("UPDATE_INTERVAL", 5)
+	createConcurrencyPerNode := clampCreateConcurrency(GetEnv("CREATE_CONCURRENCY", 3))
+	createConcurrency := computeCreateConcurrency(createConcurrencyPerNode, len(nodes))
+	createTimeoutSec := GetEnv("CREATE_TIMEOUT_SECONDS", 300)
+	if createTimeoutSec <= 0 {
+		createTimeoutSec = 300
+	}
 	logger.Infof("khala: keepalive duration: %v", keepAlive)
 	logger.Infof("khala: update interval: %v", updateInt)
+	logger.Infof("khala: create concurrency per node: %v", createConcurrencyPerNode)
+	logger.Infof("khala: total create concurrency: %v", createConcurrency)
+	logger.Infof("khala: create timeout sec: %v", createTimeoutSec)
 
 	khalaGrpcClient := make(map[string]khala.KhalaKnativeIntegrationClient)
 	for _, node := range nodes {
@@ -77,15 +93,22 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 	VMs := make([]*VMMetadata, 0, initialCap)
 
 	NodeVMCount := make(map[string]int)
+	NodeCreateInFlight := make(map[string]int)
 	for _, node := range nodes {
 		NodeVMCount[node] = 0
+		NodeCreateInFlight[node] = 0
+	}
+	createPermits := make(chan struct{}, createConcurrency)
+	for i := 0; i < createConcurrency; i++ {
+		createPermits <- struct{}{}
 	}
 
-	return &VMList{
+	vml := &VMList{
 		VMs:                  VMs,
 		Workload:             extractedName,
 		Nodes:                nodes,
 		NodeVMCount:          NodeVMCount,
+		NodeCreateInFlight:   NodeCreateInFlight,
 		nextNodeIndex:        0,
 		khalaGrpcClient:      khalaGrpcClient,
 		keepaliveDurationSec: keepAlive,
@@ -94,7 +117,125 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		runClenaupOnce:       sync.Once{},
 		revScale:             revScale,
 		vmAvailableChan:      make(chan struct{}, chanBuf),
+		createConcurrency:    createConcurrency,
+		createPermits:        createPermits,
+		createTimeoutSec:     createTimeoutSec,
+		warmBuffer:           1,
+		capacityUpdateFunc:   capacityUpdateFunc,
 	}
+	vml.Lock.Lock()
+	vml.updateAdmissionCapacityLocked()
+	vml.Lock.Unlock()
+	return vml
+}
+
+func clampCreateConcurrency(v int) int {
+	if v < 2 {
+		return 2
+	}
+	if v > 5 {
+		return 5
+	}
+	return v
+}
+
+func computeCreateConcurrency(perNode, nodeCount int) int {
+	if nodeCount < 1 {
+		nodeCount = 1
+	}
+	return perNode * nodeCount
+}
+
+func (vml *VMList) desiredAdmissionCapacityLocked() int {
+	if vml.revScale.MaxScale <= 0 {
+		return 0
+	}
+	desired := vml.TotalVMCount + vml.CreateInFlight + vml.warmBuffer
+	if desired < 1 {
+		desired = 1
+	}
+	if desired > vml.revScale.MaxScale {
+		desired = vml.revScale.MaxScale
+	}
+	return desired
+}
+
+func (vml *VMList) updateAdmissionCapacityLocked() {
+	if vml.capacityUpdateFunc == nil {
+		return
+	}
+	vml.capacityUpdateFunc(vml.desiredAdmissionCapacityLocked())
+}
+
+func (vml *VMList) reconcileCountsLocked(reason string) {
+	availableByNode := make(map[string]int, len(vml.NodeVMCount))
+	for _, vm := range vml.VMs {
+		availableByNode[vm.Node]++
+	}
+
+	sumNode := 0
+	for node, count := range vml.NodeVMCount {
+		if count < 0 {
+			vml.logger.Warnf("khala: reconcile(%s) clamping negative NodeVMCount on %s: %d", reason, node, count)
+			count = 0
+			vml.NodeVMCount[node] = 0
+		}
+		avail := availableByNode[node]
+		if count < avail {
+			vml.logger.Warnf("khala: reconcile(%s) NodeVMCount[%s]=%d < available=%d, correcting", reason, node, count, avail)
+			count = avail
+			vml.NodeVMCount[node] = count
+		}
+		sumNode += count
+	}
+	for node, avail := range availableByNode {
+		if _, ok := vml.NodeVMCount[node]; !ok {
+			vml.logger.Warnf("khala: reconcile(%s) adding missing node counter for %s=%d", reason, node, avail)
+			vml.NodeVMCount[node] = avail
+			sumNode += avail
+		}
+	}
+
+	if vml.TotalVMCount != sumNode {
+		vml.logger.Warnf("khala: reconcile(%s) TotalVMCount=%d, sum(NodeVMCount)=%d, correcting",
+			reason, vml.TotalVMCount, sumNode)
+		vml.TotalVMCount = sumNode
+	}
+
+	sumCreate := 0
+	for node, count := range vml.NodeCreateInFlight {
+		if count < 0 {
+			vml.logger.Warnf("khala: reconcile(%s) clamping negative NodeCreateInFlight on %s: %d", reason, node, count)
+			count = 0
+			vml.NodeCreateInFlight[node] = 0
+		}
+		sumCreate += count
+	}
+	if vml.CreateInFlight != sumCreate {
+		vml.logger.Warnf("khala: reconcile(%s) CreateInFlight=%d, sum(NodeCreateInFlight)=%d, correcting",
+			reason, vml.CreateInFlight, sumCreate)
+		vml.CreateInFlight = sumCreate
+	}
+}
+
+func (vml *VMList) removeVMFromOrchestrator(vm *VMMetadata) bool {
+	vml.Lock.RLock()
+	client, ok := vml.khalaGrpcClient[vm.Node]
+	vml.Lock.RUnlock()
+	if !ok {
+		vml.logger.Errorf("khala: gRPC client not found for node %s", vm.Node)
+		return false
+	}
+	resp, err := client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vm.ID})
+	if err != nil {
+		vml.logger.Warnf("khala: RemoveVM RPC failed for %s: %v", vm.ID, err)
+		return false
+	}
+	if resp == nil || !resp.Success {
+		vml.logger.Warnf("khala: RemoveVM unsuccessful for %s: %#v", vm.ID, resp)
+		return false
+	}
+	return true
 }
 
 // AcquireVM returns an available VM, creating one inline if none exists (Lambda model).
@@ -117,27 +258,19 @@ func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
 		vml.Lock.RUnlock()
 
 		if !atMax {
-			// 3. Below MaxScale: this goroutine creates the VM inline.
-			//    CreateVM atomically reserves a slot before making the gRPC call.
-			//    We pass ctx so the gRPC call is cancelled promptly if the request
-			//    times out, avoiding blocking this goroutine beyond its deadline.
-			newVM, err := vml.CreateVM(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					vml.logger.Warnf("khala: CreateVM cancelled by ctx (deadline exhausted during VM creation): %v", err)
-				} else {
-					vml.logger.Errorf("khala: failed to create VM: %v", err)
+			// 3. Below MaxScale, only permit holders are allowed to create VMs.
+			// Requests that cannot acquire a permit wait in queue. Permit holders
+			// wait for their own create result. If the request times out first,
+			// create continues detached and returns VM to pool when complete.
+			if vml.tryAcquireCreatePermit() {
+				vm, detached := vml.createForRequest(ctx)
+				if detached {
+					return nil, nil
 				}
-				// Fall through to wait — another goroutine may succeed or a VM
-				// may be released before our context expires.
-			} else if ctx.Err() != nil {
-				// Context expired during creation. Push the VM back so a
-				// live request can use it instead of invalidating a healthy VM.
-				vml.PushVM(newVM, true)
-				return nil, nil
-			} else {
-				vml.logger.Infof("khala: created VM inline: %v", newVM)
-				return func() { vml.PushVM(newVM, true) }, newVM
+				if vm != nil {
+					return func() { vml.PushVM(vm, true) }, vm
+				}
+				// Fall through to wait/retry on create failure.
 			}
 		}
 
@@ -148,6 +281,64 @@ func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
 		case <-waitCh:
 			// A VM was returned or a slot opened. Loop to try PopVM again.
 		}
+	}
+}
+
+type createResult struct {
+	vm  *VMMetadata
+	err error
+}
+
+func (vml *VMList) createForRequest(ctx context.Context) (*VMMetadata, bool) {
+	createDone := make(chan createResult, 1)
+	go func() {
+		createCtx, cancel := context.WithTimeout(context.Background(), time.Duration(vml.createTimeoutSec)*time.Second)
+		defer cancel()
+		vm, err := vml.CreateVM(createCtx)
+		createDone <- createResult{vm: vm, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Request timed out; continue create asynchronously and return VM to pool.
+		go func() {
+			res := <-createDone
+			vml.releaseCreatePermit()
+			vml.signalWaiters()
+			if res.err != nil {
+				vml.logger.Errorf("khala: detached VM create failed: %v", res.err)
+				return
+			}
+			vml.logger.Infof("khala: detached VM create completed: %v", res.vm)
+			vml.PushVM(res.vm, true)
+		}()
+		return nil, true
+	case res := <-createDone:
+		vml.releaseCreatePermit()
+		vml.signalWaiters()
+		if res.err != nil {
+			vml.logger.Errorf("khala: failed to create VM: %v", res.err)
+			return nil, false
+		}
+		vml.logger.Infof("khala: created VM inline: %v", res.vm)
+		return res.vm, false
+	}
+}
+
+func (vml *VMList) tryAcquireCreatePermit() bool {
+	select {
+	case <-vml.createPermits:
+		return true
+	default:
+		return false
+	}
+}
+
+func (vml *VMList) releaseCreatePermit() {
+	select {
+	case vml.createPermits <- struct{}{}:
+	default:
+		vml.logger.Warn("khala: create permit release dropped because limiter is already full")
 	}
 }
 
@@ -210,16 +401,16 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		return nil, fmt.Errorf("no nodes available to create a VM")
 	}
 
-	if vml.revScale.MaxScale != 0 && vml.TotalVMCount >= vml.revScale.MaxScale {
+	if vml.revScale.MaxScale != 0 && (vml.TotalVMCount+vml.CreateInFlight) >= vml.revScale.MaxScale {
 		vml.Lock.Unlock()
 		return nil, fmt.Errorf("maximum scale reached: %d", vml.revScale.MaxScale)
 	}
 
 	minNode := vml.Nodes[0]
-	minCount := vml.NodeVMCount[minNode]
+	minCount := vml.NodeVMCount[minNode] + vml.NodeCreateInFlight[minNode]
 
 	for _, node := range vml.Nodes {
-		count := vml.NodeVMCount[node]
+		count := vml.NodeVMCount[node] + vml.NodeCreateInFlight[node]
 		if count < minCount {
 			minCount = count
 			minNode = node
@@ -232,18 +423,20 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		return nil, fmt.Errorf("gRPC client not found for node %s", minNode)
 	}
 
-	// Reserve the slot before releasing the lock so concurrent CreateVM
-	// calls see the updated count and don't exceed MaxScale.
-	vml.NodeVMCount[minNode]++
-	vml.TotalVMCount++
+	// Track in-flight create separately; VM counters are updated only on
+	// confirmed create success.
+	vml.NodeCreateInFlight[minNode]++
+	vml.CreateInFlight++
+	vml.updateAdmissionCapacityLocked()
 	vml.Lock.Unlock()
 
 	resp, err := client.AddVM(ctx, &khala.AddVMRequest{VmName: vml.Workload})
 	if err != nil {
-		// Roll back the reservation on gRPC failure (includes ctx cancellation).
 		vml.Lock.Lock()
-		vml.NodeVMCount[minNode]--
-		vml.TotalVMCount--
+		vml.NodeCreateInFlight[minNode]--
+		vml.CreateInFlight--
+		vml.reconcileCountsLocked("create-failure")
+		vml.updateAdmissionCapacityLocked()
 		vml.Lock.Unlock()
 		// Wake a waiter: TotalVMCount dropped, so atMax may now be false.
 		vml.signalWaiters()
@@ -258,6 +451,15 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		LastTimeUsedMs: time.Now().UnixMilli(),
 		RetryCount:     0,
 	}
+
+	vml.Lock.Lock()
+	vml.NodeCreateInFlight[minNode]--
+	vml.CreateInFlight--
+	vml.NodeVMCount[minNode]++
+	vml.TotalVMCount++
+	vml.reconcileCountsLocked("create-success")
+	vml.updateAdmissionCapacityLocked()
+	vml.Lock.Unlock()
 
 	vml.logger.Infof("khala: created VM: %v", newVM)
 
@@ -329,58 +531,43 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 				case <-ticker.C:
 					currentTimeMs := time.Now().UnixMilli()
 					vml.Lock.Lock()
-					TotalVMs := 0
-					for _, count := range vml.NodeVMCount {
-						TotalVMs += count
-					}
-
-					{
-						keptVMsByNode := make([]*VMMetadata, 0)
-						vmsToRemove := make([]*VMMetadata, 0)
-
-						for _, vm := range vml.VMs {
-							if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
-								if vml.revScale.MinScale > 0 && vml.TotalVMCount <= vml.revScale.MinScale {
-									keptVMsByNode = append(keptVMsByNode, vm)
-									continue
-								}
-								vmsToRemove = append(vmsToRemove, vm)
-								vml.NodeVMCount[vm.Node]--
-								vml.TotalVMCount--
-
-							} else {
-								keptVMsByNode = append(keptVMsByNode, vm)
+					keptVMs := make([]*VMMetadata, 0, len(vml.VMs))
+					vmsToRemove := make([]*VMMetadata, 0)
+					for _, vm := range vml.VMs {
+						if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
+							if vml.revScale.MinScale > 0 && vml.TotalVMCount <= vml.revScale.MinScale {
+								keptVMs = append(keptVMs, vm)
+								continue
 							}
+							vmsToRemove = append(vmsToRemove, vm)
+						} else {
+							keptVMs = append(keptVMs, vm)
+						}
+					}
+					vml.VMs = keptVMs
+					vml.reconcileCountsLocked("cleanup-scan")
+					vml.Lock.Unlock()
+
+					for _, vm := range vmsToRemove {
+						if !vml.removeVMFromOrchestrator(vm) {
+							vml.logger.Warnf("khala: failed to remove idle VM %s, returning to pool", vm.ID)
+							vml.PushVM(vm, true)
+							continue
 						}
 
-						vml.VMs = keptVMsByNode
-						vmsToRemoveCount := len(vmsToRemove)
-
+						vml.Lock.Lock()
+						if vml.NodeVMCount[vm.Node] > 0 {
+							vml.NodeVMCount[vm.Node]--
+						}
+						if vml.TotalVMCount > 0 {
+							vml.TotalVMCount--
+						}
+						vml.reconcileCountsLocked("cleanup-remove-success")
+						vml.updateAdmissionCapacityLocked()
 						vml.Lock.Unlock()
 
-						// TotalVMCount dropped — wake one waiter so it can re-evaluate
-						// atMax and call CreateVM instead of sleeping until ctx deadline.
-						if vmsToRemoveCount > 0 {
-							vml.signalWaiters()
-						}
-
-						if len(vmsToRemove) > 0 {
-							var wg sync.WaitGroup
-							for _, vm := range vmsToRemove {
-								client, ok := vml.khalaGrpcClient[vm.Node]
-								if !ok {
-									vml.logger.Errorf("gRPC client not found for node %s", vm.Node)
-									continue
-								}
-								wg.Add(1)
-								go func(vmToRemove *VMMetadata, log *zap.SugaredLogger) {
-									defer wg.Done()
-									client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vmToRemove.ID})
-									log.Infof("khala: removed VM due to inactivity: %v", vmToRemove)
-								}(vm, vml.logger)
-							}
-							wg.Wait()
-						}
+						vml.signalWaiters()
+						vml.logger.Infof("khala: removed VM due to inactivity: %v", vm)
 					}
 				}
 			}
@@ -396,23 +583,23 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 		vml.PushVM(vm, false)
 	} else {
 		go func() {
-			vml.Lock.Lock()
-			client, ok := vml.khalaGrpcClient[vm.Node]
-			if !ok {
-				vml.Lock.Unlock()
-				vml.logger.Errorf("gRPC client not found for node %s", vm.Node)
+			if !vml.removeVMFromOrchestrator(vm) {
+				vml.logger.Warnf("khala: failed to remove invalid VM %s, returning to pool", vm.ID)
+				vml.PushVM(vm, false)
 				return
 			}
-			vml.Lock.Unlock()
-			client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vm.ID})
 
 			vml.Lock.Lock()
-			vml.NodeVMCount[vm.Node]--
-			vml.TotalVMCount--
+			if vml.NodeVMCount[vm.Node] > 0 {
+				vml.NodeVMCount[vm.Node]--
+			}
+			if vml.TotalVMCount > 0 {
+				vml.TotalVMCount--
+			}
+			vml.reconcileCountsLocked("invalidate-remove-success")
+			vml.updateAdmissionCapacityLocked()
 			vml.Lock.Unlock()
 
-			// A slot opened below MaxScale; wake one waiter so it can
-			// trigger CreateVM to replenish the pool.
 			vml.signalWaiters()
 			vml.logger.Infof("khala: invalidated VM: %v", vm)
 		}()

@@ -18,6 +18,7 @@ package net
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -176,6 +177,10 @@ type revisionThrottler struct {
 
 	vmList       *khala.VMList
 	khalaBreaker breaker
+
+	// When set, this revision is fail-closed due to invalid Khala scale config.
+	khalaConfigErr      error
+	khalaConfigErrLogMu sync.Once
 }
 
 func newRevisionThrottler(revID types.NamespacedName,
@@ -204,23 +209,36 @@ func newRevisionThrottler(revID types.NamespacedName,
 	}
 
 	// get revision scale info: minScale, maxScale, initialScale
-	revScale := getRevScale(annotations, logger)
+	revScale, scaleErr := getRevScale(annotations, logger)
+	if scaleErr != nil {
+		logger.Errorw("khala: invalid scale configuration, refusing traffic for revision",
+			zap.Error(scaleErr))
+	}
 
 	extractedName := khala.ExtractName(revID.String())
 	logger.Debugf("khala: extracted revID: %s", extractedName)
 
-	// All MaxScale slots are open from the start. The atMax guard inside
-	// AcquireVM enforces the hard ceiling — no ramping needed.
-	khalaBreakerParams := queue.BreakerParams{
-		QueueDepth:      breakerQueueDepth,
-		MaxConcurrency:  revScale.MaxScale,
-		InitialCapacity: revScale.MaxScale,
-	}
-	khalaBreaker := queue.NewBreaker(khalaBreakerParams)
+	var (
+		vmList       *khala.VMList
+		khalaBreaker breaker
+	)
+	if scaleErr == nil {
+		// Start with a warm capacity (initialScale+1) rather than opening all max
+		// slots at once to avoid cold-start create storms during spikes.
+		khalaBreakerParams := queue.BreakerParams{
+			QueueDepth:      breakerQueueDepth,
+			MaxConcurrency:  revScale.MaxScale,
+			InitialCapacity: computeKhalaInitialCapacity(revScale),
+		}
+		khalaBreaker = queue.NewBreaker(khalaBreakerParams)
 
-	vmList := khala.NewRevVMList(extractedName, nodes, revScale, logger)
-	go vmList.InitialScaleUp()
-	vmList.RemoveVMsWithLeastRecentUse(context.Background())
+		capacityUpdateFunc := func(capacity int) {
+			khalaBreaker.UpdateConcurrency(capacity)
+		}
+		vmList = khala.NewRevVMList(extractedName, nodes, revScale, logger, capacityUpdateFunc)
+		go vmList.InitialScaleUp()
+		vmList.RemoveVMsWithLeastRecentUse(context.Background())
+	}
 
 	return &revisionThrottler{
 		revID:                revID,
@@ -232,39 +250,82 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		vmList:               vmList,
 		khalaBreaker:         khalaBreaker,
+		khalaConfigErr:       scaleErr,
 	}
 }
 
-func getRevScale(annotations map[string]string, logger *zap.SugaredLogger) khala.RevisionScaleInfo {
-	scaleInfo := &khala.RevisionScaleInfo{}
+func computeKhalaInitialCapacity(revScale khala.RevisionScaleInfo) int {
+	initialCapacity := revScale.InitialScale + 1
+	if initialCapacity > revScale.MaxScale {
+		initialCapacity = revScale.MaxScale
+	}
+	if initialCapacity < 0 {
+		return 0
+	}
+	return initialCapacity
+}
 
-	// Prioritize Khala annotations
-	if val, ok := annotations[khalaapis.KhalaMinScaleAnnotationKey]; ok {
-		scaleInfo.MinScale, _ = strconv.Atoi(val)
+func getRevScale(annotations map[string]string, logger *zap.SugaredLogger) (khala.RevisionScaleInfo, error) {
+	scaleInfo := khala.RevisionScaleInfo{}
+
+	parseInt := func(key string, required bool) (int, error) {
+		raw, ok := annotations[key]
+		if !ok || raw == "" {
+			if required {
+				return 0, fmt.Errorf("missing required annotation %q", key)
+			}
+			return 0, nil
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, fmt.Errorf("invalid annotation %q value %q: %w", key, raw, err)
+		}
+		return n, nil
 	}
 
-	if val, ok := annotations[khalaapis.KhalaMaxScaleAnnotationKey]; ok {
-		scaleInfo.MaxScale, _ = strconv.Atoi(val)
+	maxScale, err := parseInt(khalaapis.KhalaMaxScaleAnnotationKey, true)
+	if err != nil {
+		return scaleInfo, err
 	}
-
-	if val, ok := annotations[khalaapis.KhalaInitialScaleAnnotationKey]; ok {
-		scaleInfo.InitialScale, _ = strconv.Atoi(val)
+	if maxScale < 1 {
+		return scaleInfo, fmt.Errorf("invalid annotation %q=%d: must be >= 1", khalaapis.KhalaMaxScaleAnnotationKey, maxScale)
 	}
+	scaleInfo.MaxScale = maxScale
 
-	// if val, ok := annotations[autoscaling.MinScaleAnnotationKey]; ok {
-	// 	scaleInfo.MinScale, _ = strconv.Atoi(val)
-	// }
-	// if val, ok := annotations[autoscaling.MaxScaleAnnotationKey]; ok {
-	// 	scaleInfo.MaxScale, _ = strconv.Atoi(val)
-	// }
-	// if val, ok := annotations[autoscaling.InitialScaleAnnotationKey]; ok {
-	// 	scaleInfo.InitialScale, _ = strconv.Atoi(val)
-	// }
+	minScale, err := parseInt(khalaapis.KhalaMinScaleAnnotationKey, false)
+	if err != nil {
+		return scaleInfo, err
+	}
+	if minScale < 0 {
+		return scaleInfo, fmt.Errorf("invalid annotation %q=%d: must be >= 0", khalaapis.KhalaMinScaleAnnotationKey, minScale)
+	}
+	scaleInfo.MinScale = minScale
+
+	initialScale, err := parseInt(khalaapis.KhalaInitialScaleAnnotationKey, false)
+	if err != nil {
+		return scaleInfo, err
+	}
+	if initialScale < 0 {
+		return scaleInfo, fmt.Errorf("invalid annotation %q=%d: must be >= 0", khalaapis.KhalaInitialScaleAnnotationKey, initialScale)
+	}
+	scaleInfo.InitialScale = initialScale
+
+	if scaleInfo.MinScale > scaleInfo.MaxScale {
+		return scaleInfo, fmt.Errorf("invalid scale range: %s=%d exceeds %s=%d",
+			khalaapis.KhalaMinScaleAnnotationKey, scaleInfo.MinScale,
+			khalaapis.KhalaMaxScaleAnnotationKey, scaleInfo.MaxScale)
+	}
+	if scaleInfo.InitialScale > scaleInfo.MaxScale {
+		logger.Warnf("khala: clamping %s=%d down to %s=%d",
+			khalaapis.KhalaInitialScaleAnnotationKey, scaleInfo.InitialScale,
+			khalaapis.KhalaMaxScaleAnnotationKey, scaleInfo.MaxScale)
+		scaleInfo.InitialScale = scaleInfo.MaxScale
+	}
 
 	logger.Infof("khala: revision scale info - min: %d, max: %d, initial: %d",
 		scaleInfo.MinScale, scaleInfo.MaxScale, scaleInfo.InitialScale)
 
-	return *scaleInfo
+	return scaleInfo, nil
 }
 
 func noop() {}
@@ -284,6 +345,14 @@ func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTrack
 // queue up request for each revision throttler.
 // reuse breaker used in baseline.
 func (rt *revisionThrottler) try(ctx context.Context, function func(string) error) error {
+	if rt.khalaConfigErr != nil {
+		rt.khalaConfigErrLogMu.Do(func() {
+			rt.logger.Errorw("khala: request rejected due to invalid scale configuration",
+				zap.Error(rt.khalaConfigErr))
+		})
+		return rt.khalaConfigErr
+	}
+
 	var ret error
 
 	if err := rt.khalaBreaker.Maybe(ctx, func() {
@@ -528,17 +597,30 @@ type Throttler struct {
 	nodes                   []string
 }
 
+type nodeSourceFunc func(context.Context) ([]string, error)
+
 // NewThrottler creates a new Throttler
 func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
+	return newThrottler(ctx, ipAddr, getNodes)
+}
+
+func newThrottler(ctx context.Context, ipAddr string, nodeSource nodeSourceFunc) *Throttler {
 	revisionInformer := revisioninformer.Get(ctx)
+	logger := logging.FromContext(ctx)
+	nodes, err := nodeSource(ctx)
+	if err != nil {
+		logger.Errorw("khala: failed to discover nodes, continuing with empty node list", zap.Error(err))
+		nodes = []string{}
+	}
+	logger.Infof("khala: discovered nodes: %v", nodes)
+
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
 		revisionLister:     revisionInformer.Lister(),
 		ipAddress:          ipAddr,
-		logger:             logging.FromContext(ctx),
+		logger:             logger,
 		epsUpdateCh:        make(chan *corev1.Endpoints),
-
-		nodes: getNodes(ctx),
+		nodes:              nodes,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -564,25 +646,23 @@ func NewThrottler(ctx context.Context, ipAddr string) *Throttler {
 	return t
 }
 
-func getNodes(ctx context.Context) []string {
-	logger := logging.FromContext(ctx)
+func getNodes(ctx context.Context) ([]string, error) {
 	restConfig, err := rest.InClusterConfig()
 	if err != nil {
-		logger.Fatalf("Error building in-cluster config: %s\n", err.Error())
+		return nil, fmt.Errorf("error building in-cluster config: %w", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		logger.Fatalf("Error creating clientset: %s\n", err.Error())
+		return nil, fmt.Errorf("error creating clientset: %w", err)
 	}
 
 	// Get the node list
-	nodeList, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	nodeList, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		logger.Fatalf("Error getting node list: %s\n", err.Error())
+		return nil, fmt.Errorf("error getting node list: %w", err)
 	}
 
-	// Print the CPU usage for each node
 	nodes := []string{}
 	for _, n := range nodeList.Items {
 		if n.Labels["loader-nodetype"] != "worker" && n.Labels["loader-nodetype"] != "singlenode" {
@@ -596,11 +676,12 @@ func getNodes(ctx context.Context) []string {
 				break
 			}
 		}
-		nodes = append(nodes, ip)
+		if ip != "" {
+			nodes = append(nodes, ip)
+		}
 	}
 
-	logger.Infof("Nodes: %v", nodes)
-	return nodes
+	return nodes, nil
 }
 
 // Run starts the throttler and blocks until the context is done.

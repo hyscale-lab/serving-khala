@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,6 +39,8 @@ import (
 	fakeendpointsinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/endpoints/fake"
 	. "knative.dev/pkg/logging/testing"
 	rtesting "knative.dev/pkg/reconciler/testing"
+	"knative.dev/serving/pkg/activator/net/khala"
+	khalaapis "knative.dev/serving/pkg/apis/khala"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	fakeservingclient "knative.dev/serving/pkg/client/injection/client/fake"
@@ -59,7 +62,42 @@ type tryResult struct {
 }
 
 func newTestThrottler(ctx context.Context) *Throttler {
-	return NewThrottler(ctx, "10.10.10.10")
+	return newThrottler(ctx, "10.10.10.10", func(context.Context) ([]string, error) {
+		return []string{"127.0.0.1"}, nil
+	})
+}
+
+func TestNewThrottlerUsesInjectedNodeSource(t *testing.T) {
+	ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
+	defer cancel()
+
+	want := []string{"10.0.0.1", "10.0.0.2"}
+	throttler := newThrottler(ctx, "10.10.10.10", func(context.Context) ([]string, error) {
+		return want, nil
+	})
+
+	if throttler == nil {
+		t.Fatal("newThrottler() returned nil")
+	}
+	if diff := cmp.Diff(want, throttler.nodes); diff != "" {
+		t.Fatalf("nodes mismatch (-want,+got):\n%s", diff)
+	}
+}
+
+func TestNewThrottlerNodeDiscoveryFailureUsesEmptyNodeList(t *testing.T) {
+	ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
+	defer cancel()
+
+	throttler := newThrottler(ctx, "10.10.10.10", func(context.Context) ([]string, error) {
+		return nil, errors.New("node discovery failed")
+	})
+
+	if throttler == nil {
+		t.Fatal("newThrottler() returned nil")
+	}
+	if got := len(throttler.nodes); got != 0 {
+		t.Fatalf("len(nodes) = %d, want 0", got)
+	}
 }
 
 func TestThrottlerUpdateCapacity(t *testing.T) {
@@ -617,7 +655,9 @@ func TestPodAssignmentFinite(t *testing.T) {
 	defer cancel()
 
 	throttler := newTestThrottler(ctx)
-	rt := newRevisionThrottler(revName, 42 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, []string{"127.0.0.1"}, map[string]string{}, logger)
+	rt := newRevisionThrottler(revName, 42 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, []string{"127.0.0.1"}, map[string]string{
+		khalaapis.KhalaMaxScaleAnnotationKey: "100",
+	}, logger)
 	rt.numActivators.Store(4)
 	rt.activatorIndex.Store(0)
 	throttler.revisionThrottlers[revName] = rt
@@ -669,7 +709,9 @@ func TestPodAssignmentInfinite(t *testing.T) {
 	defer cancel()
 
 	throttler := newTestThrottler(ctx)
-	rt := newRevisionThrottler(revName, 0 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, []string{"127.0.0.1"}, map[string]string{}, logger)
+	rt := newRevisionThrottler(revName, 0 /*cc*/, pkgnet.ServicePortNameHTTP1, testBreakerParams, []string{"127.0.0.1"}, map[string]string{
+		khalaapis.KhalaMaxScaleAnnotationKey: "100",
+	}, logger)
 	throttler.revisionThrottlers[revName] = rt
 
 	update := revisionDestsUpdate{
@@ -900,9 +942,154 @@ func TestMultipleActivators(t *testing.T) {
 func TestInfiniteBreakerCreation(t *testing.T) {
 	// This test verifies that we use infiniteBreaker when CC==0.
 	tttl := newRevisionThrottler(types.NamespacedName{Namespace: "a", Name: "b"}, 0, /*cc*/
-		pkgnet.ServicePortNameHTTP1, queue.BreakerParams{}, []string{"127.0.0.1"}, map[string]string{}, TestLogger(t))
+		pkgnet.ServicePortNameHTTP1, queue.BreakerParams{}, []string{"127.0.0.1"}, map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "100",
+		}, TestLogger(t))
 	if _, ok := tttl.breaker.(*infiniteBreaker); !ok {
 		t.Errorf("The type of revisionBreaker = %T, want %T", tttl, (*infiniteBreaker)(nil))
+	}
+}
+
+func TestComputeKhalaInitialCapacity(t *testing.T) {
+	tests := []struct {
+		name    string
+		max     string
+		initial string
+		want    int
+	}{{
+		name:    "scale from zero keeps one warm slot",
+		max:     "10",
+		initial: "0",
+		want:    1,
+	}, {
+		name:    "initial plus one below max",
+		max:     "10",
+		initial: "4",
+		want:    5,
+	}, {
+		name:    "capped at max",
+		max:     "3",
+		initial: "9",
+		want:    3,
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scale, err := getRevScale(map[string]string{
+				khalaapis.KhalaMaxScaleAnnotationKey:     tc.max,
+				khalaapis.KhalaInitialScaleAnnotationKey: tc.initial,
+			}, TestLogger(t))
+			if err != nil {
+				t.Fatalf("getRevScale() err = %v", err)
+			}
+			if got := computeKhalaInitialCapacity(scale); got != tc.want {
+				t.Fatalf("computeKhalaInitialCapacity() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetRevScaleValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        khala.RevisionScaleInfo
+		wantErr     string
+	}{{
+		name:        "missing max scale fails closed",
+		annotations: map[string]string{},
+		wantErr:     khalaapis.KhalaMaxScaleAnnotationKey,
+	}, {
+		name: "invalid max scale fails closed",
+		annotations: map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "not-a-number",
+		},
+		wantErr: khalaapis.KhalaMaxScaleAnnotationKey,
+	}, {
+		name: "zero max scale fails closed",
+		annotations: map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "0",
+		},
+		wantErr: "must be >= 1",
+	}, {
+		name: "negative min scale fails closed",
+		annotations: map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "10",
+			khalaapis.KhalaMinScaleAnnotationKey: "-1",
+		},
+		wantErr: khalaapis.KhalaMinScaleAnnotationKey,
+	}, {
+		name: "min exceeds max fails closed",
+		annotations: map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "2",
+			khalaapis.KhalaMinScaleAnnotationKey: "3",
+		},
+		wantErr: "exceeds",
+	}, {
+		name: "negative initial fails closed",
+		annotations: map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey:     "10",
+			khalaapis.KhalaInitialScaleAnnotationKey: "-1",
+		},
+		wantErr: khalaapis.KhalaInitialScaleAnnotationKey,
+	}, {
+		name: "initial scale over max is clamped",
+		annotations: map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey:     "3",
+			khalaapis.KhalaInitialScaleAnnotationKey: "9",
+		},
+		want: khala.RevisionScaleInfo{
+			MaxScale:     3,
+			InitialScale: 3,
+		},
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := getRevScale(tc.annotations, TestLogger(t))
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("getRevScale() err = nil, want substring %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("getRevScale() err = %q, want substring %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("getRevScale() err = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("getRevScale() = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRevisionThrottlerTryFailClosedOnInvalidKhalaScale(t *testing.T) {
+	rt := newRevisionThrottler(
+		types.NamespacedName{Namespace: testNamespace, Name: testRevision},
+		1,
+		pkgnet.ServicePortNameHTTP1,
+		testBreakerParams,
+		[]string{"127.0.0.1"},
+		map[string]string{}, // missing khala/max-scale
+		TestLogger(t),
+	)
+
+	called := false
+	err := rt.try(context.Background(), func(string) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("try() err = nil, want fail-closed error")
+	}
+	if called {
+		t.Fatal("try() invoked downstream function despite invalid scale config")
+	}
+	if !strings.Contains(err.Error(), khalaapis.KhalaMaxScaleAnnotationKey) {
+		t.Fatalf("try() err = %q, want to mention %q", err.Error(), khalaapis.KhalaMaxScaleAnnotationKey)
 	}
 }
 

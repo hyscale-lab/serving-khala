@@ -39,6 +39,7 @@ import (
 	"knative.dev/pkg/ptr"
 	rtesting "knative.dev/pkg/reconciler/testing"
 	activatortest "knative.dev/serving/pkg/activator/testing"
+	khalaapis "knative.dev/serving/pkg/apis/khala"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	fakeservingclient "knative.dev/serving/pkg/client/injection/client/fake"
@@ -70,6 +71,9 @@ func revision(revID types.NamespacedName, protocol pkgnet.ProtocolType, cc int64
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: revID.Namespace,
 			Name:      revID.Name,
+			Annotations: map[string]string{
+				khalaapis.KhalaMaxScaleAnnotationKey: "100",
+			},
 		},
 		Spec: v1.RevisionSpec{
 			ContainerConcurrency: ptr.Int64(cc),
