@@ -169,6 +169,38 @@ func TestComputeCreateConcurrency(t *testing.T) {
 	}
 }
 
+func TestQueuedDepth(t *testing.T) {
+	tests := []struct {
+		name     string
+		inFlight int
+		capacity int
+		want     int
+	}{{
+		name:     "no queue when below capacity",
+		inFlight: 2,
+		capacity: 5,
+		want:     0,
+	}, {
+		name:     "no queue when equal to capacity",
+		inFlight: 3,
+		capacity: 3,
+		want:     0,
+	}, {
+		name:     "queue when above capacity",
+		inFlight: 9,
+		capacity: 4,
+		want:     5,
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := queuedDepth(tc.inFlight, tc.capacity); got != tc.want {
+				t.Fatalf("queuedDepth(%d,%d) = %d, want %d",
+					tc.inFlight, tc.capacity, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAcquireVMRespectsCreateConcurrencyLimit(t *testing.T) {
 	createConcurrency := 3
 	client := &fakeKhalaClient{addDelay: 40 * time.Millisecond}

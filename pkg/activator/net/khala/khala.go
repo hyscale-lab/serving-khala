@@ -176,13 +176,17 @@ func (vml *VMList) reconcileCountsLocked(reason string) {
 	sumNode := 0
 	for node, count := range vml.NodeVMCount {
 		if count < 0 {
-			vml.logger.Warnf("khala: reconcile(%s) clamping negative NodeVMCount on %s: %d", reason, node, count)
+			vml.logger.Warnw("khala: reconcile corrected negative node VM count",
+				"reason", reason, "node", node, "count", count)
+			recordReconcileCorrection()
 			count = 0
 			vml.NodeVMCount[node] = 0
 		}
 		avail := availableByNode[node]
 		if count < avail {
-			vml.logger.Warnf("khala: reconcile(%s) NodeVMCount[%s]=%d < available=%d, correcting", reason, node, count, avail)
+			vml.logger.Warnw("khala: reconcile corrected node VM count below available pool",
+				"reason", reason, "node", node, "count", count, "available", avail)
+			recordReconcileCorrection()
 			count = avail
 			vml.NodeVMCount[node] = count
 		}
@@ -190,31 +194,38 @@ func (vml *VMList) reconcileCountsLocked(reason string) {
 	}
 	for node, avail := range availableByNode {
 		if _, ok := vml.NodeVMCount[node]; !ok {
-			vml.logger.Warnf("khala: reconcile(%s) adding missing node counter for %s=%d", reason, node, avail)
+			vml.logger.Warnw("khala: reconcile added missing node VM counter",
+				"reason", reason, "node", node, "available", avail)
+			recordReconcileCorrection()
 			vml.NodeVMCount[node] = avail
 			sumNode += avail
 		}
 	}
 
 	if vml.TotalVMCount != sumNode {
-		vml.logger.Warnf("khala: reconcile(%s) TotalVMCount=%d, sum(NodeVMCount)=%d, correcting",
-			reason, vml.TotalVMCount, sumNode)
+		vml.logger.Warnw("khala: reconcile corrected total VM count",
+			"reason", reason, "total_vm_count", vml.TotalVMCount, "sum_node_vm_count", sumNode)
+		recordReconcileCorrection()
 		vml.TotalVMCount = sumNode
 	}
 
 	sumCreate := 0
 	for node, count := range vml.NodeCreateInFlight {
 		if count < 0 {
-			vml.logger.Warnf("khala: reconcile(%s) clamping negative NodeCreateInFlight on %s: %d", reason, node, count)
+			vml.logger.Warnw("khala: reconcile corrected negative node create-inflight count",
+				"reason", reason, "node", node, "count", count)
+			recordReconcileCorrection()
 			count = 0
 			vml.NodeCreateInFlight[node] = 0
 		}
 		sumCreate += count
 	}
 	if vml.CreateInFlight != sumCreate {
-		vml.logger.Warnf("khala: reconcile(%s) CreateInFlight=%d, sum(NodeCreateInFlight)=%d, correcting",
-			reason, vml.CreateInFlight, sumCreate)
+		vml.logger.Warnw("khala: reconcile corrected total create-inflight count",
+			"reason", reason, "create_inflight", vml.CreateInFlight, "sum_node_create_inflight", sumCreate)
+		recordReconcileCorrection()
 		vml.CreateInFlight = sumCreate
+		recordVMCreateInFlight(vml.CreateInFlight)
 	}
 }
 
@@ -257,12 +268,14 @@ func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
 		atMax := vml.revScale.MaxScale != 0 && vml.TotalVMCount >= vml.revScale.MaxScale
 		vml.Lock.RUnlock()
 
+		gotPermit := false
 		if !atMax {
 			// 3. Below MaxScale, only permit holders are allowed to create VMs.
 			// Requests that cannot acquire a permit wait in queue. Permit holders
 			// wait for their own create result. If the request times out first,
 			// create continues detached and returns VM to pool when complete.
 			if vml.tryAcquireCreatePermit() {
+				gotPermit = true
 				vm, detached := vml.createForRequest(ctx)
 				if detached {
 					return nil, nil
@@ -275,10 +288,37 @@ func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
 		}
 
 		// 4. At MaxScale (or creation failed): wait for a VM to be released.
+		waitReason := "create-failed-or-race"
+		if atMax {
+			waitReason = "at-max-scale"
+		} else if !gotPermit {
+			waitReason = "create-permit-exhausted"
+		}
+		vml.Lock.RLock()
+		totalVMCount := vml.TotalVMCount
+		createInFlight := vml.CreateInFlight
+		maxScale := vml.revScale.MaxScale
+		vml.Lock.RUnlock()
+		vml.logger.Debugw("khala: request queued waiting for VM availability",
+			"workload", vml.Workload,
+			"reason", waitReason,
+			"total_vms", totalVMCount,
+			"create_inflight", createInFlight,
+			"max_scale", maxScale)
+
+		waitStart := time.Now()
 		select {
 		case <-ctx.Done():
+			waitLatency := time.Since(waitStart)
+			recordVMWaitLatency(waitLatency)
+			vml.logger.Infow("khala: request timed out while waiting for VM",
+				"workload", vml.Workload,
+				"reason", waitReason,
+				"wait_ms", waitLatency.Milliseconds(),
+				"error", ctx.Err())
 			return nil, nil
 		case <-waitCh:
+			recordVMWaitLatency(time.Since(waitStart))
 			// A VM was returned or a slot opened. Loop to try PopVM again.
 		}
 	}
@@ -291,6 +331,7 @@ type createResult struct {
 
 func (vml *VMList) createForRequest(ctx context.Context) (*VMMetadata, bool) {
 	createDone := make(chan createResult, 1)
+	waitStart := time.Now()
 	go func() {
 		createCtx, cancel := context.WithTimeout(context.Background(), time.Duration(vml.createTimeoutSec)*time.Second)
 		defer cancel()
@@ -300,6 +341,12 @@ func (vml *VMList) createForRequest(ctx context.Context) (*VMMetadata, bool) {
 
 	select {
 	case <-ctx.Done():
+		waitLatency := time.Since(waitStart)
+		recordVMWaitLatency(waitLatency)
+		vml.logger.Infow("khala: request timed out while waiting for VM create",
+			"workload", vml.Workload,
+			"wait_ms", waitLatency.Milliseconds(),
+			"error", ctx.Err())
 		// Request timed out; continue create asynchronously and return VM to pool.
 		go func() {
 			res := <-createDone
@@ -314,6 +361,7 @@ func (vml *VMList) createForRequest(ctx context.Context) (*VMMetadata, bool) {
 		}()
 		return nil, true
 	case res := <-createDone:
+		recordVMWaitLatency(time.Since(waitStart))
 		vml.releaseCreatePermit()
 		vml.signalWaiters()
 		if res.err != nil {
@@ -428,7 +476,13 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 	vml.NodeCreateInFlight[minNode]++
 	vml.CreateInFlight++
 	vml.updateAdmissionCapacityLocked()
+	recordVMCreateInFlight(vml.CreateInFlight)
 	vml.Lock.Unlock()
+
+	recordVMCreateAttempt()
+	vml.logger.Infow("khala: VM create started",
+		"workload", vml.Workload,
+		"node", minNode)
 
 	resp, err := client.AddVM(ctx, &khala.AddVMRequest{VmName: vml.Workload})
 	if err != nil {
@@ -437,9 +491,15 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		vml.CreateInFlight--
 		vml.reconcileCountsLocked("create-failure")
 		vml.updateAdmissionCapacityLocked()
+		recordVMCreateInFlight(vml.CreateInFlight)
 		vml.Lock.Unlock()
+		recordVMCreateFailure()
 		// Wake a waiter: TotalVMCount dropped, so atMax may now be false.
 		vml.signalWaiters()
+		vml.logger.Warnw("khala: VM create failed",
+			"workload", vml.Workload,
+			"node", minNode,
+			"error", err)
 		return nil, err
 	}
 
@@ -459,9 +519,16 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 	vml.TotalVMCount++
 	vml.reconcileCountsLocked("create-success")
 	vml.updateAdmissionCapacityLocked()
+	recordVMCreateInFlight(vml.CreateInFlight)
 	vml.Lock.Unlock()
+	recordVMCreateSuccess()
 
-	vml.logger.Infof("khala: created VM: %v", newVM)
+	vml.logger.Infow("khala: VM create succeeded",
+		"workload", vml.Workload,
+		"vm_id", newVM.ID,
+		"node", newVM.Node,
+		"ip", newVM.IP,
+		"rpc_port", newVM.RPCPort)
 
 	return newVM, nil
 }

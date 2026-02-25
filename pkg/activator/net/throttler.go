@@ -354,8 +354,11 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 	}
 
 	var ret error
+	rt.recordKhalaBreakerDepth()
+	defer rt.recordKhalaBreakerDepth()
 
 	if err := rt.khalaBreaker.Maybe(ctx, func() {
+		rt.recordKhalaBreakerDepth()
 		release, vm := rt.vmList.AcquireVM(ctx)
 		if vm == nil {
 			// This means the context timed out.
@@ -379,6 +382,14 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 		return err
 	}
 	return ret
+}
+
+func (rt *revisionThrottler) recordKhalaBreakerDepth() {
+	b, ok := rt.khalaBreaker.(*queue.Breaker)
+	if !ok || b == nil {
+		return
+	}
+	khala.RecordBreakerDepth(b.InFlight(), b.Capacity())
 }
 
 func (rt *revisionThrottler) calculateCapacity(backendCount, numTrackers, activatorCount int) int {
