@@ -483,7 +483,16 @@ func TestCreateVMErrorDoesNotCorruptCounts(t *testing.T) {
 	}
 }
 
-func TestInvalidateVMRemoveFailureDoesNotDecrementCounts(t *testing.T) {
+func TestInvalidateVMRemoveFailureTreatsVMAsDead(t *testing.T) {
+	prevRetryDelay := removeVMRetryDelay
+	prevRemoveTimeout := removeVMTimeout
+	removeVMRetryDelay = 5 * time.Millisecond
+	removeVMTimeout = 20 * time.Millisecond
+	defer func() {
+		removeVMRetryDelay = prevRetryDelay
+		removeVMTimeout = prevRemoveTimeout
+	}()
+
 	client := &fakeKhalaClient{removeErr: fmt.Errorf("remove rpc failed")}
 	vml := newTestVMList(5, 2, client)
 
@@ -494,30 +503,62 @@ func TestInvalidateVMRemoveFailureDoesNotDecrementCounts(t *testing.T) {
 	vml.Lock.Unlock()
 
 	vml.InvalidateVM(vm)
-	eventually(t, 2*time.Second, 10*time.Millisecond, func() bool {
+	eventually(t, 500*time.Millisecond, 10*time.Millisecond, func() bool {
 		vml.Lock.RLock()
 		defer vml.Lock.RUnlock()
-		return len(vml.VMs) > 0
+		return vml.TotalVMCount == 0 && vml.NodeVMCount["node-1"] == 0
 	})
 
 	vml.Lock.RLock()
 	defer vml.Lock.RUnlock()
-	if got := vml.TotalVMCount; got != 1 {
-		t.Fatalf("TotalVMCount = %d, want 1", got)
+	if got := vml.TotalVMCount; got != 0 {
+		t.Fatalf("TotalVMCount = %d, want 0", got)
 	}
-	if got := vml.NodeVMCount["node-1"]; got != 1 {
-		t.Fatalf("NodeVMCount[node-1] = %d, want 1", got)
+	if got := vml.NodeVMCount["node-1"]; got != 0 {
+		t.Fatalf("NodeVMCount[node-1] = %d, want 0", got)
 	}
-	found := false
-	for _, pooled := range vml.VMs {
-		if pooled.ID == vm.ID {
-			found = true
-			break
-		}
+	if got := len(vml.VMs); got != 0 {
+		t.Fatalf("len(VMs) = %d, want 0", got)
 	}
-	if !found {
-		t.Fatalf("expected VM %s to be returned to pool on remove failure", vm.ID)
+}
+
+func TestCleanupRemoveFailureTreatsVMAsDead(t *testing.T) {
+	prevRetryDelay := removeVMRetryDelay
+	prevRemoveTimeout := removeVMTimeout
+	removeVMRetryDelay = 5 * time.Millisecond
+	removeVMTimeout = 20 * time.Millisecond
+	defer func() {
+		removeVMRetryDelay = prevRetryDelay
+		removeVMTimeout = prevRemoveTimeout
+	}()
+
+	client := &fakeKhalaClient{removeErr: fmt.Errorf("remove rpc failed")}
+	vml := newTestVMList(5, 2, client)
+	vml.keepaliveDurationSec = 1
+	vml.updateIntervalSec = 1
+
+	vm := &VMMetadata{
+		ID:             "vm-idle",
+		Node:           "node-1",
+		RPCPort:        "8080",
+		LastTimeUsedMs: time.Now().Add(-2 * time.Second).UnixMilli(),
 	}
+
+	vml.Lock.Lock()
+	vml.VMs = append(vml.VMs, vm)
+	vml.TotalVMCount = 1
+	vml.NodeVMCount["node-1"] = 1
+	vml.Lock.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	vml.RemoveVMsWithLeastRecentUse(ctx)
+
+	eventually(t, 1500*time.Millisecond, 10*time.Millisecond, func() bool {
+		vml.Lock.RLock()
+		defer vml.Lock.RUnlock()
+		return vml.TotalVMCount == 0 && vml.NodeVMCount["node-1"] == 0 && len(vml.VMs) == 0
+	})
 }
 
 func eventually(t *testing.T, timeout, interval time.Duration, cond func() bool) {

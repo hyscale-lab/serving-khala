@@ -12,6 +12,13 @@ import (
 	khala "knative.dev/serving/pkg/proto"
 )
 
+const removeVMMaxAttempts = 3
+
+var (
+	removeVMRetryDelay = 2 * time.Second
+	removeVMTimeout    = 5 * time.Second
+)
+
 // VMMetadata holds metadata for a single VM
 // including its IP and the last time it was used (in milliseconds)
 type VMMetadata struct {
@@ -237,7 +244,9 @@ func (vml *VMList) removeVMFromOrchestrator(vm *VMMetadata) bool {
 		vml.logger.Errorf("khala: gRPC client not found for node %s", vm.Node)
 		return false
 	}
-	resp, err := client.RemoveVM(context.Background(), &khala.RemoveVMRequest{VmId: vm.ID})
+	ctx, cancel := context.WithTimeout(context.Background(), removeVMTimeout)
+	defer cancel()
+	resp, err := client.RemoveVM(ctx, &khala.RemoveVMRequest{VmId: vm.ID})
 	if err != nil {
 		vml.logger.Warnf("khala: RemoveVM RPC failed for %s: %v", vm.ID, err)
 		return false
@@ -247,6 +256,22 @@ func (vml *VMList) removeVMFromOrchestrator(vm *VMMetadata) bool {
 		return false
 	}
 	return true
+}
+
+func (vml *VMList) removeVMFromOrchestratorWithRetry(vm *VMMetadata, reason string) {
+	for attempt := 1; attempt <= removeVMMaxAttempts; attempt++ {
+		if vml.removeVMFromOrchestrator(vm) {
+			vml.logger.Infof("khala: removed %s VM: %v", reason, vm)
+			return
+		}
+		if attempt == removeVMMaxAttempts {
+			break
+		}
+		time.Sleep(removeVMRetryDelay)
+	}
+
+	vml.logger.Warnf("khala: failed to remove %s VM %s after %d attempts; treating it as dead",
+		reason, vm.ID, removeVMMaxAttempts)
 }
 
 // AcquireVM returns an available VM, creating one inline if none exists (Lambda model).
@@ -616,12 +641,6 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 					vml.Lock.Unlock()
 
 					for _, vm := range vmsToRemove {
-						if !vml.removeVMFromOrchestrator(vm) {
-							vml.logger.Warnf("khala: failed to remove idle VM %s, returning to pool", vm.ID)
-							vml.PushVM(vm, true)
-							continue
-						}
-
 						vml.Lock.Lock()
 						if vml.NodeVMCount[vm.Node] > 0 {
 							vml.NodeVMCount[vm.Node]--
@@ -629,12 +648,12 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 						if vml.TotalVMCount > 0 {
 							vml.TotalVMCount--
 						}
-						vml.reconcileCountsLocked("cleanup-remove-success")
+						vml.reconcileCountsLocked("cleanup-remove")
 						vml.updateAdmissionCapacityLocked()
 						vml.Lock.Unlock()
 
 						vml.signalWaiters()
-						vml.logger.Infof("khala: removed VM due to inactivity: %v", vm)
+						go vml.removeVMFromOrchestratorWithRetry(vm, "idle")
 					}
 				}
 			}
@@ -649,26 +668,20 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 		vml.logger.Debugf("khala: VM %s retry count increased to %d", vm.ID, vm.RetryCount)
 		vml.PushVM(vm, false)
 	} else {
+		vml.Lock.Lock()
+		if vml.NodeVMCount[vm.Node] > 0 {
+			vml.NodeVMCount[vm.Node]--
+		}
+		if vml.TotalVMCount > 0 {
+			vml.TotalVMCount--
+		}
+		vml.reconcileCountsLocked("invalidate-remove")
+		vml.updateAdmissionCapacityLocked()
+		vml.Lock.Unlock()
+
+		vml.signalWaiters()
 		go func() {
-			if !vml.removeVMFromOrchestrator(vm) {
-				vml.logger.Warnf("khala: failed to remove invalid VM %s, returning to pool", vm.ID)
-				vml.PushVM(vm, false)
-				return
-			}
-
-			vml.Lock.Lock()
-			if vml.NodeVMCount[vm.Node] > 0 {
-				vml.NodeVMCount[vm.Node]--
-			}
-			if vml.TotalVMCount > 0 {
-				vml.TotalVMCount--
-			}
-			vml.reconcileCountsLocked("invalidate-remove-success")
-			vml.updateAdmissionCapacityLocked()
-			vml.Lock.Unlock()
-
-			vml.signalWaiters()
-			vml.logger.Infof("khala: invalidated VM: %v", vm)
+			vml.removeVMFromOrchestratorWithRetry(vm, "invalid")
 		}()
 	}
 }
