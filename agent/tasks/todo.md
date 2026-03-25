@@ -224,3 +224,235 @@
 - [ ] Default create cap = 3 per node (operator-tunable, recommended 2-5 per node).
 - [ ] Missing/invalid `khala/max-scale` fails closed.
 - [ ] Autoscaler bypass remains supported but explicit and reversible.
+
+---
+
+# Planning - 2026-03-25 Khala Correctness Follow-up
+
+## Goal and acceptance criteria
+
+- [ ] Restate goal + acceptance criteria
+  - Goal: resolve the four reviewed Khala correctness findings with the smallest safe changes, one approval-gated step at a time.
+  - Done when:
+    - scale-down never removes below `minScale` in a single cleanup pass,
+    - `AddVM` responses are validated before VM counters/routing are updated,
+    - request/proxy failures only invalidate VMs for explicitly unhealthy cases,
+    - equal-load node selection no longer pins to the first node,
+    - each change lands with focused regression coverage and explicit verification evidence.
+
+## Task 1 - Cleanup must respect `minScale` across a full scan
+
+- [x] Task 1.1: re-read the cleanup path and write down the exact invariant
+  - Scope:
+    - inspect `RemoveVMsWithLeastRecentUse`,
+    - confirm the current overshoot path,
+    - lock the invariant: "a cleanup pass must never schedule removal that would take `TotalVMCount` below `MinScale`."
+  - Approval gate:
+    - wait for your explicit approval before starting this step.
+  - Result (2026-03-25):
+    - Overshoot confirmed: the cleanup scan selects idle VMs against an unchanged `TotalVMCount`, then decrements counts later during removal, so one pass can schedule more removals than the `MinScale` floor allows.
+    - Locked invariant: in a single cleanup pass, planned removals must never exceed `max(0, TotalVMCount - MinScale)`, and only currently idle VMs in the available pool may be considered removable.
+
+- [x] Task 1.2: implement the minimal cleanup fix
+  - Scope:
+    - keep the current cleanup structure,
+    - make the removal selection account for already-selected removals in the same pass,
+    - avoid unrelated refactors or policy changes.
+  - Approval gate:
+    - wait for your explicit approval before editing code for this step.
+  - Result (2026-03-25):
+    - Implemented a per-pass `removableBudget` in `RemoveVMsWithLeastRecentUse`.
+    - Cleanup now schedules at most `TotalVMCount - MinScale` idle VMs for removal in a scan, while preserving the existing post-scan removal flow.
+
+- [x] Task 1.3: add one focused regression test
+  - Scope:
+    - add a test proving multiple idle VMs do not scale below `minScale` in one tick,
+    - keep the test local to `pkg/activator/net/khala`.
+  - Approval gate:
+    - wait for your explicit approval before adding or changing tests for this step.
+  - Result (2026-03-25):
+    - Added `TestCleanupDoesNotScaleBelowMinScaleInSinglePass` in `pkg/activator/net/khala/khala_test.go`.
+    - The test seeds three idle VMs with `MinScale=1` and asserts cleanup settles at exactly one remaining available VM.
+
+- [x] Task 1.4: run focused verification and record the result
+  - Scope:
+    - run the smallest relevant Khala test target,
+    - record pass/fail evidence in this file.
+  - Approval gate:
+    - wait for your explicit approval before running verification for this step.
+  - Verification (2026-03-25):
+    - `GOCACHE=/tmp/go-build go test ./pkg/activator/net/khala -run TestCleanupDoesNotScaleBelowMinScaleInSinglePass -count=1`
+    - Result: pass
+
+## Task 2 - `AddVM` must validate RPC success before counting or routing
+
+- [x] Task 2.1: lock the validation contract for `AddVMResponse`
+  - Scope:
+    - confirm which response fields are required for a usable VM,
+    - document the intended behavior for `success=false`, empty `vm_id`, empty `ip`, or empty `rpc_port`.
+  - Approval gate:
+    - wait for your explicit approval before starting this step.
+  - Result (2026-03-25):
+    - Locked validation contract for `CreateVM`:
+      - require a non-nil `AddVMResponse`,
+      - require `success=true`,
+      - require non-empty `vm_id`, `ip`, and `rpc_port` before returning or counting a VM.
+    - Locked failure behavior:
+      - if `success=false`, `vm_id` is empty, `ip` is empty, `rpc_port` is empty, or the response is nil, treat the call as a create failure,
+      - do not increment `NodeVMCount` or `TotalVMCount`,
+      - follow the same rollback/waiter-wakeup path as transport-level create failure.
+    - `workload_name` is informational and not required for routing, so it stays out of the minimal validation set.
+
+- [x] Task 2.2: implement the minimal `CreateVM` validation
+  - Scope:
+    - keep `CreateVM` structure intact,
+    - reject unsuccessful or incomplete responses before incrementing VM counts,
+    - treat invalid responses like create failures.
+  - Approval gate:
+    - wait for your explicit approval before editing code for this step.
+  - Result (2026-03-25):
+    - Added a small `validateAddVMResponse` helper in `pkg/activator/net/khala/khala.go`.
+    - `CreateVM` now validates the RPC payload before constructing/counting a VM and reuses the existing create-failure rollback path for invalid responses.
+
+- [x] Task 2.3: add one focused regression test
+  - Scope:
+    - add a test covering unsuccessful or incomplete `AddVM` responses,
+    - assert counters remain correct and no unusable VM is returned.
+  - Approval gate:
+    - wait for your explicit approval before adding or changing tests for this step.
+  - Result (2026-03-25):
+    - Added `TestCreateVMInvalidResponseDoesNotCorruptCounts` in `pkg/activator/net/khala/khala_test.go`.
+    - Added a minimal fake-client hook to return a custom `AddVMResponse` so the test can exercise the non-transport failure path.
+
+- [x] Task 2.4: run focused verification and record the result
+  - Scope:
+    - run the smallest relevant Khala test target,
+    - record pass/fail evidence in this file.
+  - Approval gate:
+    - wait for your explicit approval before running verification for this step.
+  - Verification (2026-03-25):
+    - `GOCACHE=/tmp/go-build go test ./pkg/activator/net/khala -run TestCreateVMInvalidResponseDoesNotCorruptCounts -count=1`
+    - Result: pass
+
+## Task 3 - Invalidate only on explicit unhealthy backend failures
+
+- [x] Task 3.1: map the current request/proxy error flow and define the unhealthy error class
+  - Scope:
+    - trace `handler -> throttler -> proxy`,
+    - list which failures should invalidate a VM,
+    - list which failures must return the VM to pool, including likely timeout/overload cases.
+  - Approval gate:
+    - wait for your explicit approval before starting this step.
+  - Result (2026-03-25):
+    - Current flow confirmed:
+      - `activationHandler.ServeHTTP` calls `throttler.Try` with a callback that always returns `nil` after `proxyRequest`,
+      - `proxyRequest` installs `ReverseProxy.ErrorHandler`, which handles proxy transport failures locally instead of returning them to `Try`,
+      - therefore proxy transport errors do not currently reach `revisionThrottler.try`, and the existing `ret != nil && ctx.Err() == nil` invalidation branch does not classify real proxy failures today.
+    - Locked minimal unhealthy error class for the follow-up implementation:
+      - only invalidate when proxy transport returns an explicit endpoint-unreachable error proving the selected VM cannot be dialed or routed,
+      - initial narrow set: connection refused, no route to host, host unreachable, or network unreachable.
+    - Locked non-unhealthy class:
+      - request context cancellation or deadline,
+      - breaker queue full / admission timeout,
+      - VM create wait timeout,
+      - backend HTTP status codes,
+      - generic transport timeout / overload / temporary congestion scenarios that can happen on a healthy but crowded node.
+    - Implementation implication:
+      - Task 3.2 should add a small error-return path from proxy transport failures back into `throttler.try`, plus a narrow predicate that only maps the explicit endpoint-unreachable class to `InvalidateVM`.
+
+- [x] Task 3.2: implement the smallest error-propagation change
+  - Scope:
+    - preserve the current request flow,
+    - propagate proxy transport errors back into `Try` only as needed,
+    - add a narrow predicate for unhealthy backend failures,
+    - keep generic timeout/load errors from calling `InvalidateVM`.
+  - Approval gate:
+    - wait for your explicit approval before editing code for this step.
+  - Result (2026-03-25):
+    - `proxyRequest` now returns handled proxy transport errors back to `ServeHTTP`, and the handler forwards them into `throttler.Try`.
+    - Added a small handled-error wrapper so `ServeHTTP` does not write a second HTTP error after `ReverseProxy.ErrorHandler` already handled the response.
+    - `revisionThrottler.try` now invalidates only for the explicit endpoint-unreachable class (`ECONNREFUSED`, `EHOSTUNREACH`, `ENETUNREACH`) and returns the VM to pool for all other failure cases.
+
+- [x] Task 3.3: add focused regression coverage
+  - Scope:
+    - add a test for an explicitly unhealthy failure that invalidates,
+    - add a test for a likely healthy failure path that does not invalidate.
+  - Approval gate:
+    - wait for your explicit approval before adding or changing tests for this step.
+  - Result (2026-03-25):
+    - Added `TestRevisionThrottlerTryInvalidatesOnExplicitEndpointUnreachable` in `pkg/activator/net/throttler_test.go`.
+    - Added `TestRevisionThrottlerTryDoesNotInvalidateOnTimeoutLikeFailure` in `pkg/activator/net/throttler_test.go`.
+    - The two tests exercise the exact `revisionThrottler.try` invalidation decision using wrapped endpoint-unreachable vs wrapped timeout-like errors.
+
+- [x] Task 3.4: run focused verification and record the result
+  - Scope:
+    - run the smallest relevant activator and Khala test targets,
+    - record pass/fail evidence in this file.
+  - Approval gate:
+    - wait for your explicit approval before running verification for this step.
+  - Verification (2026-03-25):
+    - `GOCACHE=/tmp/go-build go test ./pkg/activator/net -run 'TestRevisionThrottlerTryInvalidatesOnExplicitEndpointUnreachable|TestRevisionThrottlerTryDoesNotInvalidateOnTimeoutLikeFailure' -count=1`
+    - Result: pass
+    - `GOCACHE=/tmp/go-build go test ./pkg/activator/handler -run '^$' -count=1`
+    - Result: pass (`[no tests to run]`, compile check only)
+
+## Task 4 - Equal-load placement needs a fair tie-breaker
+
+- [x] Task 4.1: choose the smallest maintainable tie-breaker
+  - Scope:
+    - compare a rotating index vs pseudo-random tie-break,
+    - pick the simpler option that avoids permanent first-node bias,
+    - keep behavior deterministic enough for tests.
+  - Approval gate:
+    - wait for your explicit approval before starting this step.
+  - Result (2026-03-25):
+    - Chosen tie-breaker: rotating selection among equal lowest-load candidate nodes.
+    - Reason:
+      - avoids permanent `node[0]` bias,
+      - reuses the existing `nextNodeIndex` field already present in `VMList`,
+      - stays deterministic and test-friendly,
+      - is smaller and easier to maintain than introducing pseudo-random selection and seed management.
+    - Locked implementation shape for Task 4.2:
+      - keep the current least-loaded policy,
+      - gather the nodes tied for minimum `(NodeVMCount + NodeCreateInFlight)`,
+      - choose among those tied nodes by rotating `nextNodeIndex` under `vml.Lock`,
+      - leave non-tie behavior unchanged.
+
+- [x] Task 4.2: implement the minimal selection change
+  - Scope:
+    - touch only the node-selection logic in `CreateVM`,
+    - avoid changing the overall least-loaded policy.
+  - Approval gate:
+    - wait for your explicit approval before editing code for this step.
+  - Result (2026-03-25):
+    - Updated `CreateVM` in `pkg/activator/net/khala/khala.go` to gather the equal minimum-load candidate nodes and rotate across that tie set using `nextNodeIndex`.
+    - Non-tie behavior is unchanged: a single least-loaded node is still selected directly.
+  - Follow-up adjustment (2026-03-25, approved as Task 4.2b):
+    - Seeded `nextNodeIndex` once in `NewRevVMList` using a UnixNano-based helper so the first create for a new revision no longer defaults to `node[0]`.
+    - Kept the rotating tie-breaker for later equal-load selections and avoided adding a UUID dependency.
+
+- [x] Task 4.3: add one focused distribution test
+  - Scope:
+    - prove equal-count candidates do not always pick the first node,
+    - keep the test narrow and stable.
+  - Approval gate:
+    - wait for your explicit approval before adding or changing tests for this step.
+  - Result (2026-03-25):
+    - Added `TestCreateVMFirstTieUsesSeededInitialNodeOffset` in `pkg/activator/net/khala/khala_test.go`.
+    - The test overrides the seed helper deterministically, builds a two-node `VMList`, and asserts the first `CreateVM` on an equal-load tie can select the second node instead of defaulting to `node[0]`.
+
+- [x] Task 4.4: run focused verification and record the result
+  - Scope:
+    - run the smallest relevant Khala test target,
+    - record pass/fail evidence in this file.
+  - Approval gate:
+    - wait for your explicit approval before running verification for this step.
+  - Verification (2026-03-25):
+    - `GOCACHE=/tmp/go-build go test ./pkg/activator/net/khala -run TestCreateVMFirstTieUsesSeededInitialNodeOffset -count=1`
+    - Result: pass
+
+## Execution rule
+
+- [ ] Only one step may be active at a time.
+- [ ] No implementation, test edit, or verification command starts until you explicitly approve that specific step.
+- [ ] Keep each code change minimal, local, and easy to maintain.

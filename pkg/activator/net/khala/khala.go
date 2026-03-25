@@ -15,8 +15,14 @@ import (
 const removeVMMaxAttempts = 3
 
 var (
-	removeVMRetryDelay = 2 * time.Second
-	removeVMTimeout    = 5 * time.Second
+	removeVMRetryDelay       = 2 * time.Second
+	removeVMTimeout          = 5 * time.Second
+	initialNextNodeIndexFunc = func(nodeCount int) int {
+		if nodeCount <= 1 {
+			return 0
+		}
+		return int(time.Now().UnixNano() % int64(nodeCount))
+	}
 )
 
 // VMMetadata holds metadata for a single VM
@@ -116,7 +122,7 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		Nodes:                nodes,
 		NodeVMCount:          NodeVMCount,
 		NodeCreateInFlight:   NodeCreateInFlight,
-		nextNodeIndex:        0,
+		nextNodeIndex:        initialNextNodeIndexFunc(len(nodes)),
 		khalaGrpcClient:      khalaGrpcClient,
 		keepaliveDurationSec: keepAlive,
 		updateIntervalSec:    updateInt,
@@ -465,6 +471,25 @@ func (vml *VMList) signalWaiters() {
 	}
 }
 
+func validateAddVMResponse(resp *khala.AddVMResponse) error {
+	if resp == nil {
+		return fmt.Errorf("AddVM returned nil response")
+	}
+	if !resp.Success {
+		return fmt.Errorf("AddVM unsuccessful")
+	}
+	if resp.VmId == "" {
+		return fmt.Errorf("AddVM returned empty vm_id")
+	}
+	if resp.Ip == "" {
+		return fmt.Errorf("AddVM returned empty ip")
+	}
+	if resp.RpcPort == "" {
+		return fmt.Errorf("AddVM returned empty rpc_port")
+	}
+	return nil
+}
+
 // CreateVM creates a new VM on the node with the fewest active VMs.
 func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 	vml.Lock.Lock()
@@ -479,15 +504,23 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		return nil, fmt.Errorf("maximum scale reached: %d", vml.revScale.MaxScale)
 	}
 
-	minNode := vml.Nodes[0]
-	minCount := vml.NodeVMCount[minNode] + vml.NodeCreateInFlight[minNode]
-
-	for _, node := range vml.Nodes {
+	candidateNodes := make([]string, 0, len(vml.Nodes))
+	minCount := 0
+	for i, node := range vml.Nodes {
 		count := vml.NodeVMCount[node] + vml.NodeCreateInFlight[node]
-		if count < minCount {
+		if i == 0 || count < minCount {
 			minCount = count
-			minNode = node
+			candidateNodes = candidateNodes[:0]
+			candidateNodes = append(candidateNodes, node)
+		} else if count == minCount {
+			candidateNodes = append(candidateNodes, node)
 		}
+	}
+
+	minNode := candidateNodes[0]
+	if len(candidateNodes) > 1 {
+		minNode = candidateNodes[vml.nextNodeIndex%len(candidateNodes)]
+		vml.nextNodeIndex++
 	}
 
 	client, ok := vml.khalaGrpcClient[minNode]
@@ -510,6 +543,9 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		"node", minNode)
 
 	resp, err := client.AddVM(ctx, &khala.AddVMRequest{VmName: vml.Workload})
+	if err == nil {
+		err = validateAddVMResponse(resp)
+	}
 	if err != nil {
 		vml.Lock.Lock()
 		vml.NodeCreateInFlight[minNode]--
@@ -625,16 +661,20 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 					vml.Lock.Lock()
 					keptVMs := make([]*VMMetadata, 0, len(vml.VMs))
 					vmsToRemove := make([]*VMMetadata, 0)
+					// Limit this cleanup pass so we never schedule removals below minScale.
+					removableBudget := vml.TotalVMCount - vml.revScale.MinScale
+					if removableBudget < 0 {
+						removableBudget = 0
+					}
 					for _, vm := range vml.VMs {
 						if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
-							if vml.revScale.MinScale > 0 && vml.TotalVMCount <= vml.revScale.MinScale {
-								keptVMs = append(keptVMs, vm)
+							if removableBudget > 0 {
+								vmsToRemove = append(vmsToRemove, vm)
+								removableBudget--
 								continue
 							}
-							vmsToRemove = append(vmsToRemove, vm)
-						} else {
-							keptVMs = append(keptVMs, vm)
 						}
+						keptVMs = append(keptVMs, vm)
 					}
 					vml.VMs = keptVMs
 					vml.reconcileCountsLocked("cleanup-scan")

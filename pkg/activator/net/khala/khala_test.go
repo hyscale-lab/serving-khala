@@ -20,6 +20,7 @@ type fakeKhalaClient struct {
 	seq        int64
 	onAddStart func()
 	addErr     error
+	addResp    *pb.AddVMResponse
 	removeErr  error
 	removeOK   bool
 	removeSet  bool
@@ -48,6 +49,9 @@ func (f *fakeKhalaClient) AddVM(ctx context.Context, _ *pb.AddVMRequest, _ ...gr
 	}
 
 	id := atomic.AddInt64(&f.seq, 1)
+	if f.addResp != nil {
+		return f.addResp, nil
+	}
 	return &pb.AddVMResponse{
 		Success: true,
 		VmId:    fmt.Sprintf("vm-%d", id),
@@ -483,6 +487,65 @@ func TestCreateVMErrorDoesNotCorruptCounts(t *testing.T) {
 	}
 }
 
+func TestCreateVMFirstTieUsesSeededInitialNodeOffset(t *testing.T) {
+	prev := initialNextNodeIndexFunc
+	initialNextNodeIndexFunc = func(nodeCount int) int {
+		if nodeCount != 2 {
+			t.Fatalf("initialNextNodeIndexFunc got nodeCount=%d, want 2", nodeCount)
+		}
+		return 1
+	}
+	defer func() {
+		initialNextNodeIndexFunc = prev
+	}()
+
+	vml := NewRevVMList("test-workload", []string{"node-1", "node-2"}, RevisionScaleInfo{MaxScale: 5}, zap.NewNop().Sugar(), nil)
+	vml.khalaGrpcClient = map[string]pb.KhalaKnativeIntegrationClient{
+		"node-1": &fakeKhalaClient{},
+		"node-2": &fakeKhalaClient{},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	vm, err := vml.CreateVM(ctx)
+	if err != nil {
+		t.Fatalf("CreateVM() err = %v", err)
+	}
+	if vm.Node != "node-2" {
+		t.Fatalf("first CreateVM() node = %q, want %q", vm.Node, "node-2")
+	}
+}
+
+func TestCreateVMInvalidResponseDoesNotCorruptCounts(t *testing.T) {
+	client := &fakeKhalaClient{
+		addResp: &pb.AddVMResponse{
+			Success: false,
+		},
+	}
+	vml := newTestVMList(5, 2, client)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := vml.CreateVM(ctx); err == nil {
+		t.Fatal("CreateVM() err = nil, want error for invalid AddVM response")
+	}
+
+	vml.Lock.RLock()
+	defer vml.Lock.RUnlock()
+	if got := vml.TotalVMCount; got != 0 {
+		t.Fatalf("TotalVMCount = %d, want 0", got)
+	}
+	if got := vml.NodeVMCount["node-1"]; got != 0 {
+		t.Fatalf("NodeVMCount[node-1] = %d, want 0", got)
+	}
+	if got := vml.CreateInFlight; got != 0 {
+		t.Fatalf("CreateInFlight = %d, want 0", got)
+	}
+	if got := vml.NodeCreateInFlight["node-1"]; got != 0 {
+		t.Fatalf("NodeCreateInFlight[node-1] = %d, want 0", got)
+	}
+}
+
 func TestInvalidateVMRemoveFailureTreatsVMAsDead(t *testing.T) {
 	prevRetryDelay := removeVMRetryDelay
 	prevRemoveTimeout := removeVMTimeout
@@ -558,6 +621,48 @@ func TestCleanupRemoveFailureTreatsVMAsDead(t *testing.T) {
 		vml.Lock.RLock()
 		defer vml.Lock.RUnlock()
 		return vml.TotalVMCount == 0 && vml.NodeVMCount["node-1"] == 0 && len(vml.VMs) == 0
+	})
+}
+
+func TestCleanupDoesNotScaleBelowMinScaleInSinglePass(t *testing.T) {
+	client := &fakeKhalaClient{removeSet: true, removeOK: true}
+	vml := newTestVMList(5, 2, client)
+	vml.revScale.MinScale = 1
+	vml.keepaliveDurationSec = 1
+	vml.updateIntervalSec = 1
+
+	idleAt := time.Now().Add(-2 * time.Second).UnixMilli()
+	vms := []*VMMetadata{{
+		ID:             "vm-idle-1",
+		Node:           "node-1",
+		RPCPort:        "8080",
+		LastTimeUsedMs: idleAt,
+	}, {
+		ID:             "vm-idle-2",
+		Node:           "node-1",
+		RPCPort:        "8080",
+		LastTimeUsedMs: idleAt,
+	}, {
+		ID:             "vm-idle-3",
+		Node:           "node-1",
+		RPCPort:        "8080",
+		LastTimeUsedMs: idleAt,
+	}}
+
+	vml.Lock.Lock()
+	vml.VMs = append(vml.VMs, vms...)
+	vml.TotalVMCount = len(vms)
+	vml.NodeVMCount["node-1"] = len(vms)
+	vml.Lock.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	vml.RemoveVMsWithLeastRecentUse(ctx)
+
+	eventually(t, 1500*time.Millisecond, 10*time.Millisecond, func() bool {
+		vml.Lock.RLock()
+		defer vml.Lock.RUnlock()
+		return vml.TotalVMCount == 1 && vml.NodeVMCount["node-1"] == 1 && len(vml.VMs) == 1
 	})
 }
 

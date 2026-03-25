@@ -18,11 +18,13 @@ package net
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"sync"
+	"syscall"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -330,6 +332,15 @@ func getRevScale(annotations map[string]string, logger *zap.SugaredLogger) (khal
 
 func noop() {}
 
+func shouldInvalidateVM(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH)
+}
+
 // Returns a dest that at the moment of choosing had an open slot
 // for request.
 func (rt *revisionThrottler) acquireDest(ctx context.Context) (func(), *podTracker) {
@@ -367,12 +378,12 @@ func (rt *revisionThrottler) try(ctx context.Context, function func(string) erro
 		}
 
 		defer func() {
-			if ret != nil && ctx.Err() == nil {
-				// Non-context error: the VM itself may be unhealthy, invalidate it.
+			if ctx.Err() == nil && shouldInvalidateVM(ret) {
+				// Only explicit endpoint-unreachable errors invalidate the VM.
 				rt.vmList.InvalidateVM(vm)
 			} else {
-				// Either success, or the request's own deadline/cancellation caused
-				// the failure — the VM is healthy, return it to the pool.
+				// Success, request cancellation, or a potentially healthy failure:
+				// return the VM to the pool.
 				release()
 			}
 		}()

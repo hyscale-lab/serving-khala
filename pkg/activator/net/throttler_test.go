@@ -19,9 +19,11 @@ package net
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1090,6 +1092,76 @@ func TestRevisionThrottlerTryFailClosedOnInvalidKhalaScale(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), khalaapis.KhalaMaxScaleAnnotationKey) {
 		t.Fatalf("try() err = %q, want to mention %q", err.Error(), khalaapis.KhalaMaxScaleAnnotationKey)
+	}
+}
+
+func TestRevisionThrottlerTryInvalidatesOnExplicitEndpointUnreachable(t *testing.T) {
+	rt := newRevisionThrottler(
+		types.NamespacedName{Namespace: testNamespace, Name: testRevision},
+		1,
+		pkgnet.ServicePortNameHTTP1,
+		testBreakerParams,
+		[]string{"127.0.0.1"},
+		map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "10",
+		},
+		TestLogger(t),
+	)
+
+	vm := &khala.VMMetadata{ID: "vm-1", Node: "127.0.0.1", RPCPort: "8080", RetryCount: 2}
+	rt.vmList.PushVM(vm, false)
+
+	err := rt.try(context.Background(), func(string) error {
+		return fmt.Errorf("proxy dial failed: %w", syscall.ECONNREFUSED)
+	})
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("try() err = %v, want wrapped ECONNREFUSED", err)
+	}
+
+	got := rt.vmList.PopVM()
+	if got == nil {
+		t.Fatal("expected invalidated VM to be returned to pool")
+	}
+	if got.ID != vm.ID {
+		t.Fatalf("got VM %q, want %q", got.ID, vm.ID)
+	}
+	if got.RetryCount != 3 {
+		t.Fatalf("RetryCount = %d, want 3 after invalidation", got.RetryCount)
+	}
+}
+
+func TestRevisionThrottlerTryDoesNotInvalidateOnTimeoutLikeFailure(t *testing.T) {
+	rt := newRevisionThrottler(
+		types.NamespacedName{Namespace: testNamespace, Name: testRevision},
+		1,
+		pkgnet.ServicePortNameHTTP1,
+		testBreakerParams,
+		[]string{"127.0.0.1"},
+		map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "10",
+		},
+		TestLogger(t),
+	)
+
+	vm := &khala.VMMetadata{ID: "vm-2", Node: "127.0.0.1", RPCPort: "8080", RetryCount: 2}
+	rt.vmList.PushVM(vm, false)
+
+	err := rt.try(context.Background(), func(string) error {
+		return fmt.Errorf("proxy timeout on crowded node: %w", context.DeadlineExceeded)
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("try() err = %v, want wrapped DeadlineExceeded", err)
+	}
+
+	got := rt.vmList.PopVM()
+	if got == nil {
+		t.Fatal("expected VM to be returned to pool")
+	}
+	if got.ID != vm.ID {
+		t.Fatalf("got VM %q, want %q", got.ID, vm.ID)
+	}
+	if got.RetryCount != 0 {
+		t.Fatalf("RetryCount = %d, want 0 after healthy failure release", got.RetryCount)
 	}
 }
 

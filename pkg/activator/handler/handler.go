@@ -61,6 +61,18 @@ type activationHandler struct {
 	tls              bool
 }
 
+type handledProxyError struct {
+	err error
+}
+
+func (e *handledProxyError) Error() string {
+	return e.err.Error()
+}
+
+func (e *handledProxyError) Unwrap() error {
+	return e.err
+}
+
 // New constructs a new http.Handler that deals with revision activation.
 func New(_ context.Context, t Throttler, transport http.RoundTripper, usePassthroughLb bool, logger *zap.SugaredLogger, tlsEnabled bool) http.Handler {
 	return &activationHandler{
@@ -94,14 +106,19 @@ func (a *activationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if tracingEnabled {
 			proxyCtx, proxySpan = trace.StartSpan(r.Context(), "activator_proxy")
 		}
-		a.proxyRequest(revID, w, r.WithContext(proxyCtx), dest, tracingEnabled, a.usePassthroughLb)
+		err := a.proxyRequest(revID, w, r.WithContext(proxyCtx), dest, tracingEnabled, a.usePassthroughLb)
 		proxySpan.End()
 
-		return nil
+		return err
 	}); err != nil {
 		// Set error on our capacity waiting span and end it.
 		trySpan.Annotate([]trace.Attribute{trace.StringAttribute("activator.throttler.error", err.Error())}, "ThrottlerTry")
 		trySpan.End()
+
+		var handledErr *handledProxyError
+		if errors.As(err, &handledErr) {
+			return
+		}
 
 		a.logger.Errorw("Throttler try error", zap.String(logkey.Key, revID.String()), zap.Error(err))
 
@@ -114,7 +131,7 @@ func (a *activationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *activationHandler) proxyRequest(revID types.NamespacedName, w http.ResponseWriter,
-	r *http.Request, target string, tracingEnabled bool, usePassthroughLb bool) {
+	r *http.Request, target string, tracingEnabled bool, usePassthroughLb bool) error {
 	netheader.RewriteHostIn(r)
 	r.Header.Set(netheader.ProxyKey, activator.Name)
 
@@ -137,11 +154,17 @@ func (a *activationHandler) proxyRequest(revID types.NamespacedName, w http.Resp
 		proxy.Transport = a.tracingTransport
 	}
 	proxy.FlushInterval = netproxy.FlushInterval
+	var proxyErr error
 	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+		proxyErr = err
 		pkghandler.Error(a.logger.With(zap.String(logkey.Key, revID.String())))(w, req, err)
 	}
 
 	proxy.ServeHTTP(w, r)
+	if proxyErr != nil {
+		return &handledProxyError{err: proxyErr}
+	}
+	return nil
 }
 
 // useSecurePort replaces the default port with HTTPS port (8112).
