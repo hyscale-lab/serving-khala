@@ -20,6 +20,7 @@ message AddVMResponse {
     string workload_name = 3;
     string ip = 4;
     string rpc_port = 5;
+    repeated string trace_info = 6;
 }
 
 message RemoveVMRequest {
