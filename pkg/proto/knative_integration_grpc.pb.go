@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion7
 
 const (
 	KhalaKnativeIntegration_AddVM_FullMethodName          = "/proto.KhalaKnativeIntegration/AddVM"
+	KhalaKnativeIntegration_GetVMMetrics_FullMethodName   = "/proto.KhalaKnativeIntegration/GetVMMetrics"
 	KhalaKnativeIntegration_RemoveVM_FullMethodName       = "/proto.KhalaKnativeIntegration/RemoveVM"
 	KhalaKnativeIntegration_DestroyAll_FullMethodName     = "/proto.KhalaKnativeIntegration/DestroyAll"
 	KhalaKnativeIntegration_CreateSnapshot_FullMethodName = "/proto.KhalaKnativeIntegration/CreateSnapshot"
@@ -30,6 +31,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type KhalaKnativeIntegrationClient interface {
 	AddVM(ctx context.Context, in *AddVMRequest, opts ...grpc.CallOption) (*AddVMResponse, error)
+	GetVMMetrics(ctx context.Context, in *GetVMMetricsRequest, opts ...grpc.CallOption) (*GetVMMetricsResponse, error)
 	RemoveVM(ctx context.Context, in *RemoveVMRequest, opts ...grpc.CallOption) (*RemoveVMResponse, error)
 	DestroyAll(ctx context.Context, in *DestroyAllRequest, opts ...grpc.CallOption) (*DestroyAllResponse, error)
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
@@ -46,6 +48,15 @@ func NewKhalaKnativeIntegrationClient(cc grpc.ClientConnInterface) KhalaKnativeI
 func (c *khalaKnativeIntegrationClient) AddVM(ctx context.Context, in *AddVMRequest, opts ...grpc.CallOption) (*AddVMResponse, error) {
 	out := new(AddVMResponse)
 	err := c.cc.Invoke(ctx, KhalaKnativeIntegration_AddVM_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *khalaKnativeIntegrationClient) GetVMMetrics(ctx context.Context, in *GetVMMetricsRequest, opts ...grpc.CallOption) (*GetVMMetricsResponse, error) {
+	out := new(GetVMMetricsResponse)
+	err := c.cc.Invoke(ctx, KhalaKnativeIntegration_GetVMMetrics_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +95,7 @@ func (c *khalaKnativeIntegrationClient) CreateSnapshot(ctx context.Context, in *
 // for forward compatibility
 type KhalaKnativeIntegrationServer interface {
 	AddVM(context.Context, *AddVMRequest) (*AddVMResponse, error)
+	GetVMMetrics(context.Context, *GetVMMetricsRequest) (*GetVMMetricsResponse, error)
 	RemoveVM(context.Context, *RemoveVMRequest) (*RemoveVMResponse, error)
 	DestroyAll(context.Context, *DestroyAllRequest) (*DestroyAllResponse, error)
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
@@ -96,6 +108,9 @@ type UnimplementedKhalaKnativeIntegrationServer struct {
 
 func (UnimplementedKhalaKnativeIntegrationServer) AddVM(context.Context, *AddVMRequest) (*AddVMResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AddVM not implemented")
+}
+func (UnimplementedKhalaKnativeIntegrationServer) GetVMMetrics(context.Context, *GetVMMetricsRequest) (*GetVMMetricsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetVMMetrics not implemented")
 }
 func (UnimplementedKhalaKnativeIntegrationServer) RemoveVM(context.Context, *RemoveVMRequest) (*RemoveVMResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RemoveVM not implemented")
@@ -134,6 +149,24 @@ func _KhalaKnativeIntegration_AddVM_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(KhalaKnativeIntegrationServer).AddVM(ctx, req.(*AddVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KhalaKnativeIntegration_GetVMMetrics_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVMMetricsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KhalaKnativeIntegrationServer).GetVMMetrics(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KhalaKnativeIntegration_GetVMMetrics_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KhalaKnativeIntegrationServer).GetVMMetrics(ctx, req.(*GetVMMetricsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -202,6 +235,10 @@ var KhalaKnativeIntegration_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AddVM",
 			Handler:    _KhalaKnativeIntegration_AddVM_Handler,
+		},
+		{
+			MethodName: "GetVMMetrics",
+			Handler:    _KhalaKnativeIntegration_GetVMMetrics_Handler,
 		},
 		{
 			MethodName: "RemoveVM",

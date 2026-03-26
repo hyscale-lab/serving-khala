@@ -5,6 +5,7 @@ package proto;
 
 service KhalaKnativeIntegration {
     rpc AddVM(AddVMRequest) returns (AddVMResponse);
+    rpc GetVMMetrics(GetVMMetricsRequest) returns (GetVMMetricsResponse);
     rpc RemoveVM(RemoveVMRequest) returns (RemoveVMResponse);
     rpc DestroyAll(DestroyAllRequest) returns (DestroyAllResponse);
     rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
@@ -21,6 +22,16 @@ message AddVMResponse {
     string ip = 4;
     string rpc_port = 5;
     repeated string trace_info = 6;
+}
+
+message GetVMMetricsRequest {
+    string vm_id = 1;
+}
+
+message GetVMMetricsResponse {
+    uint64 working_set_pages = 1;
+    uint64 pages_served_after_working_set = 2;
+    int64 working_set_insertion_ns = 3;
 }
 
 message RemoveVMRequest {

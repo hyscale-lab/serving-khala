@@ -149,6 +149,110 @@ func (x *AddVMResponse) GetTraceInfo() []string {
 	return nil
 }
 
+type GetVMMetricsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetVMMetricsRequest) Reset() {
+	*x = GetVMMetricsRequest{}
+	mi := &file_knative_integration_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetVMMetricsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetVMMetricsRequest) ProtoMessage() {}
+
+func (x *GetVMMetricsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_knative_integration_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetVMMetricsRequest.ProtoReflect.Descriptor instead.
+func (*GetVMMetricsRequest) Descriptor() ([]byte, []int) {
+	return file_knative_integration_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *GetVMMetricsRequest) GetVmId() string {
+	if x != nil {
+		return x.VmId
+	}
+	return ""
+}
+
+type GetVMMetricsResponse struct {
+	state                      protoimpl.MessageState `protogen:"open.v1"`
+	WorkingSetPages            uint64                 `protobuf:"varint,1,opt,name=working_set_pages,json=workingSetPages,proto3" json:"working_set_pages,omitempty"`
+	PagesServedAfterWorkingSet uint64                 `protobuf:"varint,2,opt,name=pages_served_after_working_set,json=pagesServedAfterWorkingSet,proto3" json:"pages_served_after_working_set,omitempty"`
+	WorkingSetInsertionNs      int64                  `protobuf:"varint,3,opt,name=working_set_insertion_ns,json=workingSetInsertionNs,proto3" json:"working_set_insertion_ns,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
+}
+
+func (x *GetVMMetricsResponse) Reset() {
+	*x = GetVMMetricsResponse{}
+	mi := &file_knative_integration_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetVMMetricsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetVMMetricsResponse) ProtoMessage() {}
+
+func (x *GetVMMetricsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_knative_integration_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetVMMetricsResponse.ProtoReflect.Descriptor instead.
+func (*GetVMMetricsResponse) Descriptor() ([]byte, []int) {
+	return file_knative_integration_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *GetVMMetricsResponse) GetWorkingSetPages() uint64 {
+	if x != nil {
+		return x.WorkingSetPages
+	}
+	return 0
+}
+
+func (x *GetVMMetricsResponse) GetPagesServedAfterWorkingSet() uint64 {
+	if x != nil {
+		return x.PagesServedAfterWorkingSet
+	}
+	return 0
+}
+
+func (x *GetVMMetricsResponse) GetWorkingSetInsertionNs() int64 {
+	if x != nil {
+		return x.WorkingSetInsertionNs
+	}
+	return 0
+}
+
 type RemoveVMRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
@@ -158,7 +262,7 @@ type RemoveVMRequest struct {
 
 func (x *RemoveVMRequest) Reset() {
 	*x = RemoveVMRequest{}
-	mi := &file_knative_integration_proto_msgTypes[2]
+	mi := &file_knative_integration_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -170,7 +274,7 @@ func (x *RemoveVMRequest) String() string {
 func (*RemoveVMRequest) ProtoMessage() {}
 
 func (x *RemoveVMRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_knative_integration_proto_msgTypes[2]
+	mi := &file_knative_integration_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -183,7 +287,7 @@ func (x *RemoveVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveVMRequest.ProtoReflect.Descriptor instead.
 func (*RemoveVMRequest) Descriptor() ([]byte, []int) {
-	return file_knative_integration_proto_rawDescGZIP(), []int{2}
+	return file_knative_integration_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *RemoveVMRequest) GetVmId() string {
@@ -203,7 +307,7 @@ type RemoveVMResponse struct {
 
 func (x *RemoveVMResponse) Reset() {
 	*x = RemoveVMResponse{}
-	mi := &file_knative_integration_proto_msgTypes[3]
+	mi := &file_knative_integration_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -215,7 +319,7 @@ func (x *RemoveVMResponse) String() string {
 func (*RemoveVMResponse) ProtoMessage() {}
 
 func (x *RemoveVMResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_knative_integration_proto_msgTypes[3]
+	mi := &file_knative_integration_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -228,7 +332,7 @@ func (x *RemoveVMResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveVMResponse.ProtoReflect.Descriptor instead.
 func (*RemoveVMResponse) Descriptor() ([]byte, []int) {
-	return file_knative_integration_proto_rawDescGZIP(), []int{3}
+	return file_knative_integration_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *RemoveVMResponse) GetSuccess() bool {
@@ -254,7 +358,7 @@ type DestroyAllRequest struct {
 
 func (x *DestroyAllRequest) Reset() {
 	*x = DestroyAllRequest{}
-	mi := &file_knative_integration_proto_msgTypes[4]
+	mi := &file_knative_integration_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -266,7 +370,7 @@ func (x *DestroyAllRequest) String() string {
 func (*DestroyAllRequest) ProtoMessage() {}
 
 func (x *DestroyAllRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_knative_integration_proto_msgTypes[4]
+	mi := &file_knative_integration_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -279,7 +383,7 @@ func (x *DestroyAllRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DestroyAllRequest.ProtoReflect.Descriptor instead.
 func (*DestroyAllRequest) Descriptor() ([]byte, []int) {
-	return file_knative_integration_proto_rawDescGZIP(), []int{4}
+	return file_knative_integration_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *DestroyAllRequest) GetDestroyAll() bool {
@@ -298,7 +402,7 @@ type DestroyAllResponse struct {
 
 func (x *DestroyAllResponse) Reset() {
 	*x = DestroyAllResponse{}
-	mi := &file_knative_integration_proto_msgTypes[5]
+	mi := &file_knative_integration_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -310,7 +414,7 @@ func (x *DestroyAllResponse) String() string {
 func (*DestroyAllResponse) ProtoMessage() {}
 
 func (x *DestroyAllResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_knative_integration_proto_msgTypes[5]
+	mi := &file_knative_integration_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -323,7 +427,7 @@ func (x *DestroyAllResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DestroyAllResponse.ProtoReflect.Descriptor instead.
 func (*DestroyAllResponse) Descriptor() ([]byte, []int) {
-	return file_knative_integration_proto_rawDescGZIP(), []int{5}
+	return file_knative_integration_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *DestroyAllResponse) GetSuccess() bool {
@@ -342,7 +446,7 @@ type CreateSnapshotRequest struct {
 
 func (x *CreateSnapshotRequest) Reset() {
 	*x = CreateSnapshotRequest{}
-	mi := &file_knative_integration_proto_msgTypes[6]
+	mi := &file_knative_integration_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -354,7 +458,7 @@ func (x *CreateSnapshotRequest) String() string {
 func (*CreateSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_knative_integration_proto_msgTypes[6]
+	mi := &file_knative_integration_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -367,7 +471,7 @@ func (x *CreateSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_knative_integration_proto_rawDescGZIP(), []int{6}
+	return file_knative_integration_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *CreateSnapshotRequest) GetWorkload() string {
@@ -387,7 +491,7 @@ type CreateSnapshotResponse struct {
 
 func (x *CreateSnapshotResponse) Reset() {
 	*x = CreateSnapshotResponse{}
-	mi := &file_knative_integration_proto_msgTypes[7]
+	mi := &file_knative_integration_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -399,7 +503,7 @@ func (x *CreateSnapshotResponse) String() string {
 func (*CreateSnapshotResponse) ProtoMessage() {}
 
 func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_knative_integration_proto_msgTypes[7]
+	mi := &file_knative_integration_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -412,7 +516,7 @@ func (x *CreateSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_knative_integration_proto_rawDescGZIP(), []int{7}
+	return file_knative_integration_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *CreateSnapshotResponse) GetSuccess() bool {
@@ -443,7 +547,13 @@ const file_knative_integration_proto_rawDesc = "" +
 	"\x02ip\x18\x04 \x01(\tR\x02ip\x12\x19\n" +
 	"\brpc_port\x18\x05 \x01(\tR\arpcPort\x12\x1d\n" +
 	"\n" +
-	"trace_info\x18\x06 \x03(\tR\ttraceInfo\"&\n" +
+	"trace_info\x18\x06 \x03(\tR\ttraceInfo\"*\n" +
+	"\x13GetVMMetricsRequest\x12\x13\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"\xbf\x01\n" +
+	"\x14GetVMMetricsResponse\x12*\n" +
+	"\x11working_set_pages\x18\x01 \x01(\x04R\x0fworkingSetPages\x12B\n" +
+	"\x1epages_served_after_working_set\x18\x02 \x01(\x04R\x1apagesServedAfterWorkingSet\x127\n" +
+	"\x18working_set_insertion_ns\x18\x03 \x01(\x03R\x15workingSetInsertionNs\"&\n" +
 	"\x0fRemoveVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"F\n" +
 	"\x10RemoveVMResponse\x12\x18\n" +
@@ -458,9 +568,10 @@ const file_knative_integration_proto_rawDesc = "" +
 	"\bworkload\x18\x01 \x01(\tR\bworkload\"L\n" +
 	"\x16CreateSnapshotResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage2\x9c\x02\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage2\xe5\x02\n" +
 	"\x17KhalaKnativeIntegration\x122\n" +
-	"\x05AddVM\x12\x13.proto.AddVMRequest\x1a\x14.proto.AddVMResponse\x12;\n" +
+	"\x05AddVM\x12\x13.proto.AddVMRequest\x1a\x14.proto.AddVMResponse\x12G\n" +
+	"\fGetVMMetrics\x12\x1a.proto.GetVMMetricsRequest\x1a\x1b.proto.GetVMMetricsResponse\x12;\n" +
 	"\bRemoveVM\x12\x16.proto.RemoveVMRequest\x1a\x17.proto.RemoveVMResponse\x12A\n" +
 	"\n" +
 	"DestroyAll\x12\x18.proto.DestroyAllRequest\x1a\x19.proto.DestroyAllResponse\x12M\n" +
@@ -478,28 +589,32 @@ func file_knative_integration_proto_rawDescGZIP() []byte {
 	return file_knative_integration_proto_rawDescData
 }
 
-var file_knative_integration_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_knative_integration_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_knative_integration_proto_goTypes = []any{
 	(*AddVMRequest)(nil),           // 0: proto.AddVMRequest
 	(*AddVMResponse)(nil),          // 1: proto.AddVMResponse
-	(*RemoveVMRequest)(nil),        // 2: proto.RemoveVMRequest
-	(*RemoveVMResponse)(nil),       // 3: proto.RemoveVMResponse
-	(*DestroyAllRequest)(nil),      // 4: proto.DestroyAllRequest
-	(*DestroyAllResponse)(nil),     // 5: proto.DestroyAllResponse
-	(*CreateSnapshotRequest)(nil),  // 6: proto.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil), // 7: proto.CreateSnapshotResponse
+	(*GetVMMetricsRequest)(nil),    // 2: proto.GetVMMetricsRequest
+	(*GetVMMetricsResponse)(nil),   // 3: proto.GetVMMetricsResponse
+	(*RemoveVMRequest)(nil),        // 4: proto.RemoveVMRequest
+	(*RemoveVMResponse)(nil),       // 5: proto.RemoveVMResponse
+	(*DestroyAllRequest)(nil),      // 6: proto.DestroyAllRequest
+	(*DestroyAllResponse)(nil),     // 7: proto.DestroyAllResponse
+	(*CreateSnapshotRequest)(nil),  // 8: proto.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil), // 9: proto.CreateSnapshotResponse
 }
 var file_knative_integration_proto_depIdxs = []int32{
 	0, // 0: proto.KhalaKnativeIntegration.AddVM:input_type -> proto.AddVMRequest
-	2, // 1: proto.KhalaKnativeIntegration.RemoveVM:input_type -> proto.RemoveVMRequest
-	4, // 2: proto.KhalaKnativeIntegration.DestroyAll:input_type -> proto.DestroyAllRequest
-	6, // 3: proto.KhalaKnativeIntegration.CreateSnapshot:input_type -> proto.CreateSnapshotRequest
-	1, // 4: proto.KhalaKnativeIntegration.AddVM:output_type -> proto.AddVMResponse
-	3, // 5: proto.KhalaKnativeIntegration.RemoveVM:output_type -> proto.RemoveVMResponse
-	5, // 6: proto.KhalaKnativeIntegration.DestroyAll:output_type -> proto.DestroyAllResponse
-	7, // 7: proto.KhalaKnativeIntegration.CreateSnapshot:output_type -> proto.CreateSnapshotResponse
-	4, // [4:8] is the sub-list for method output_type
-	0, // [0:4] is the sub-list for method input_type
+	2, // 1: proto.KhalaKnativeIntegration.GetVMMetrics:input_type -> proto.GetVMMetricsRequest
+	4, // 2: proto.KhalaKnativeIntegration.RemoveVM:input_type -> proto.RemoveVMRequest
+	6, // 3: proto.KhalaKnativeIntegration.DestroyAll:input_type -> proto.DestroyAllRequest
+	8, // 4: proto.KhalaKnativeIntegration.CreateSnapshot:input_type -> proto.CreateSnapshotRequest
+	1, // 5: proto.KhalaKnativeIntegration.AddVM:output_type -> proto.AddVMResponse
+	3, // 6: proto.KhalaKnativeIntegration.GetVMMetrics:output_type -> proto.GetVMMetricsResponse
+	5, // 7: proto.KhalaKnativeIntegration.RemoveVM:output_type -> proto.RemoveVMResponse
+	7, // 8: proto.KhalaKnativeIntegration.DestroyAll:output_type -> proto.DestroyAllResponse
+	9, // 9: proto.KhalaKnativeIntegration.CreateSnapshot:output_type -> proto.CreateSnapshotResponse
+	5, // [5:10] is the sub-list for method output_type
+	0, // [0:5] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -516,7 +631,7 @@ func file_knative_integration_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_knative_integration_proto_rawDesc), len(file_knative_integration_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
