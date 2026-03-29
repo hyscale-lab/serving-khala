@@ -177,8 +177,10 @@ type revisionThrottler struct {
 
 	logger *zap.SugaredLogger
 
-	vmList       *khala.VMList
-	khalaBreaker breaker
+	vmList          *khala.VMList
+	khalaBreaker    breaker
+	nodeLoadTracker *khala.NodeLoadTracker
+	vmCountReporter deployedVMCountReporter
 
 	// When set, this revision is fail-closed due to invalid Khala scale config.
 	khalaConfigErr      error
@@ -191,6 +193,16 @@ func newRevisionThrottler(revID types.NamespacedName,
 	nodes []string,
 	annotations map[string]string,
 	logger *zap.SugaredLogger) *revisionThrottler {
+	return newRevisionThrottlerWithNodeLoadTracker(revID, containerConcurrency, proto, breakerParams, nodes, annotations, logger, nil)
+}
+
+func newRevisionThrottlerWithNodeLoadTracker(revID types.NamespacedName,
+	containerConcurrency int, proto string,
+	breakerParams queue.BreakerParams,
+	nodes []string,
+	annotations map[string]string,
+	logger *zap.SugaredLogger,
+	nodeLoadTracker *khala.NodeLoadTracker) *revisionThrottler {
 	logger = logger.With(zap.String(logkey.Key, revID.String()))
 	var (
 		revBreaker breaker
@@ -219,6 +231,9 @@ func newRevisionThrottler(revID types.NamespacedName,
 
 	extractedName := khala.ExtractName(revID.String())
 	logger.Debugf("khala: extracted revID: %s", extractedName)
+	if nodeLoadTracker == nil {
+		nodeLoadTracker = khala.NewNodeLoadTracker(nodes)
+	}
 
 	var (
 		vmList       *khala.VMList
@@ -237,7 +252,7 @@ func newRevisionThrottler(revID types.NamespacedName,
 		capacityUpdateFunc := func(capacity int) {
 			khalaBreaker.UpdateConcurrency(capacity)
 		}
-		vmList = khala.NewRevVMList(extractedName, nodes, revScale, logger, capacityUpdateFunc)
+		vmList = khala.NewRevVMList(extractedName, nodes, revScale, logger, capacityUpdateFunc, nodeLoadTracker)
 		go vmList.InitialScaleUp()
 		vmList.RemoveVMsWithLeastRecentUse(context.Background())
 	}
@@ -252,8 +267,38 @@ func newRevisionThrottler(revID types.NamespacedName,
 		lbPolicy:             lbp,
 		vmList:               vmList,
 		khalaBreaker:         khalaBreaker,
+		nodeLoadTracker:      nodeLoadTracker,
 		khalaConfigErr:       scaleErr,
 	}
+}
+
+func (rt *revisionThrottler) setVMCountReporter(reporter deployedVMCountReporter) {
+	rt.vmCountReporter = reporter
+	if reporter == nil {
+		return
+	}
+	if rt.vmList != nil {
+		rt.vmList.SetVMCountUpdateFunc(reporter.Report)
+		return
+	}
+	reporter.Report(0, nil)
+}
+
+func (rt *revisionThrottler) reportZeroDeployedVMCounts() {
+	if rt == nil || rt.vmCountReporter == nil {
+		return
+	}
+
+	perNode := make(map[string]int)
+	if rt.vmList != nil {
+		_, currentPerNode := rt.vmList.SnapshotDeployedVMCounts()
+		perNode = make(map[string]int, len(currentPerNode))
+		for node := range currentPerNode {
+			perNode[node] = 0
+		}
+	}
+
+	rt.vmCountReporter.Report(0, perNode)
 }
 
 func computeKhalaInitialCapacity(revScale khala.RevisionScaleInfo) int {
@@ -617,6 +662,7 @@ type Throttler struct {
 	logger                  *zap.SugaredLogger
 	epsUpdateCh             chan *corev1.Endpoints
 	nodes                   []string
+	nodeLoadTracker         *khala.NodeLoadTracker
 }
 
 type nodeSourceFunc func(context.Context) ([]string, error)
@@ -635,6 +681,8 @@ func newThrottler(ctx context.Context, ipAddr string, nodeSource nodeSourceFunc)
 		nodes = []string{}
 	}
 	logger.Infof("khala: discovered nodes: %v", nodes)
+	nodeLoadTracker := khala.NewNodeLoadTracker(nodes)
+	nodeLoadTracker.SetLoadUpdateFunc(newClusterNodeLoadReporter().Report)
 
 	t := &Throttler{
 		revisionThrottlers: make(map[types.NamespacedName]*revisionThrottler),
@@ -643,6 +691,7 @@ func newThrottler(ctx context.Context, ipAddr string, nodeSource nodeSourceFunc)
 		logger:             logger,
 		epsUpdateCh:        make(chan *corev1.Endpoints),
 		nodes:              nodes,
+		nodeLoadTracker:    nodeLoadTracker,
 	}
 
 	// Watch revisions to create throttler with backlog immediately and delete
@@ -756,7 +805,7 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 		if err != nil {
 			return nil, err
 		}
-		revThrottler = newRevisionThrottler(
+		revThrottler = newRevisionThrottlerWithNodeLoadTracker(
 			revID,
 			int(rev.Spec.GetContainerConcurrency()),
 			pkgnet.ServicePortName(rev.GetProtocol()),
@@ -764,7 +813,14 @@ func (t *Throttler) getOrCreateRevisionThrottler(revID types.NamespacedName) (*r
 			t.nodes,
 			rev.GetAnnotations(),
 			t.logger,
+			t.nodeLoadTracker,
 		)
+		revThrottler.setVMCountReporter(newRevisionVMCountReporter(
+			rev.Namespace,
+			rev.Labels[serving.ServiceLabelKey],
+			rev.Labels[serving.ConfigurationLabelKey],
+			rev.Name,
+		))
 		t.revisionThrottlers[revID] = revThrottler
 	}
 	return revThrottler, nil
@@ -799,6 +855,9 @@ func (t *Throttler) revisionDeleted(obj interface{}) {
 
 	t.revisionThrottlersMutex.Lock()
 	defer t.revisionThrottlersMutex.Unlock()
+	if rt, ok := t.revisionThrottlers[revID]; ok {
+		rt.reportZeroDeployedVMCounts()
+	}
 	delete(t.revisionThrottlers, revID)
 }
 

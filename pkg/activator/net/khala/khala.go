@@ -34,6 +34,7 @@ type VMMetadata struct {
 	Node           string
 	LastTimeUsedMs int64
 	RetryCount     int
+	InUse          bool
 }
 
 type RevisionScaleInfo struct {
@@ -43,8 +44,8 @@ type RevisionScaleInfo struct {
 }
 
 type VMList struct {
-	// UPDATED: Changed from a flat slice to a map of slices, keyed by node name.
-	VMs                  []*VMMetadata
+	// Idle VMs remain revision-local, partitioned by node.
+	idleVMsByNode        map[string][]*VMMetadata
 	Workload             string
 	Nodes                []string
 	NodeVMCount          map[string]int
@@ -52,6 +53,7 @@ type VMList struct {
 	TotalVMCount         int
 	CreateInFlight       int
 	nextNodeIndex        int
+	nextAcquireNodeIndex int
 	khalaGrpcClient      map[string]khala.KhalaKnativeIntegrationClient
 	keepaliveDurationSec int
 	updateIntervalSec    int
@@ -65,9 +67,11 @@ type VMList struct {
 	createTimeoutSec     int
 	warmBuffer           int
 	capacityUpdateFunc   func(int)
+	nodeLoadTracker      *NodeLoadTracker
+	vmCountUpdateFunc    func(total int, perNode map[string]int)
 }
 
-func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger, capacityUpdateFunc func(int)) *VMList {
+func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleInfo, logger *zap.SugaredLogger, capacityUpdateFunc func(int), nodeLoadTracker *NodeLoadTracker) *VMList {
 	logger.Infof("khala: initializing VMList with nodes: %v", nodes)
 
 	keepAlive := GetEnv("KEEPALIVE_DURATION", 60)
@@ -103,11 +107,12 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 	if chanBuf < 1 {
 		chanBuf = 1
 	}
-	VMs := make([]*VMMetadata, 0, initialCap)
+	idleVMsByNode := make(map[string][]*VMMetadata, len(nodes))
 
 	NodeVMCount := make(map[string]int)
 	NodeCreateInFlight := make(map[string]int)
 	for _, node := range nodes {
+		idleVMsByNode[node] = make([]*VMMetadata, 0, initialCap)
 		NodeVMCount[node] = 0
 		NodeCreateInFlight[node] = 0
 	}
@@ -115,14 +120,18 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 	for i := 0; i < createConcurrency; i++ {
 		createPermits <- struct{}{}
 	}
+	if nodeLoadTracker == nil {
+		nodeLoadTracker = NewNodeLoadTracker(nodes)
+	}
 
 	vml := &VMList{
-		VMs:                  VMs,
+		idleVMsByNode:        idleVMsByNode,
 		Workload:             extractedName,
 		Nodes:                nodes,
 		NodeVMCount:          NodeVMCount,
 		NodeCreateInFlight:   NodeCreateInFlight,
 		nextNodeIndex:        initialNextNodeIndexFunc(len(nodes)),
+		nextAcquireNodeIndex: initialNextNodeIndexFunc(len(nodes)),
 		khalaGrpcClient:      khalaGrpcClient,
 		keepaliveDurationSec: keepAlive,
 		updateIntervalSec:    updateInt,
@@ -135,11 +144,90 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 		createTimeoutSec:     createTimeoutSec,
 		warmBuffer:           1,
 		capacityUpdateFunc:   capacityUpdateFunc,
+		nodeLoadTracker:      nodeLoadTracker,
 	}
 	vml.Lock.Lock()
 	vml.updateAdmissionCapacityLocked()
 	vml.Lock.Unlock()
 	return vml
+}
+
+func (vml *VMList) NodeLoadTracker() *NodeLoadTracker {
+	if vml == nil {
+		return nil
+	}
+	return vml.nodeLoadTracker
+}
+
+func (vml *VMList) SnapshotDeployedVMCounts() (int, map[string]int) {
+	vml.Lock.RLock()
+	defer vml.Lock.RUnlock()
+	return vml.snapshotDeployedVMCountsLocked()
+}
+
+func (vml *VMList) SetVMCountUpdateFunc(fn func(total int, perNode map[string]int)) {
+	vml.Lock.Lock()
+	vml.vmCountUpdateFunc = fn
+	total, perNode := vml.snapshotDeployedVMCountsLocked()
+	vml.Lock.Unlock()
+
+	if fn != nil {
+		fn(total, perNode)
+	}
+}
+
+func (vml *VMList) snapshotDeployedVMCountsLocked() (int, map[string]int) {
+	perNode := make(map[string]int, len(vml.NodeVMCount))
+	for node, count := range vml.NodeVMCount {
+		perNode[node] = count
+	}
+	return vml.TotalVMCount, perNode
+}
+
+func (vml *VMList) vmCountUpdateLocked() (func(int, map[string]int), int, map[string]int) {
+	if vml.vmCountUpdateFunc == nil {
+		return nil, 0, nil
+	}
+	total, perNode := vml.snapshotDeployedVMCountsLocked()
+	return vml.vmCountUpdateFunc, total, perNode
+}
+
+func (vml *VMList) selectCreateNodeLocked() string {
+	candidateNodes := make([]string, 0, len(vml.Nodes))
+	var minPrimary int64
+	var minActive int64
+	for i, node := range vml.Nodes {
+		var primary int64
+		var active int64
+		if vml.nodeLoadTracker != nil {
+			if load, ok := vml.nodeLoadTracker.Load(node); ok {
+				primary = load.LiveVMs + load.CreateInFlight
+				active = load.ActiveRequests
+			}
+		} else {
+			primary = int64(vml.NodeVMCount[node] + vml.NodeCreateInFlight[node])
+		}
+
+		if i == 0 || primary < minPrimary || (primary == minPrimary && active < minActive) {
+			minPrimary = primary
+			minActive = active
+			candidateNodes = candidateNodes[:0]
+			candidateNodes = append(candidateNodes, node)
+		} else if primary == minPrimary && active == minActive {
+			candidateNodes = append(candidateNodes, node)
+		}
+	}
+
+	if len(candidateNodes) == 0 {
+		return ""
+	}
+
+	minNode := candidateNodes[0]
+	if len(candidateNodes) > 1 {
+		minNode = candidateNodes[vml.nextNodeIndex%len(candidateNodes)]
+		vml.nextNodeIndex++
+	}
+	return minNode
 }
 
 func clampCreateConcurrency(v int) int {
@@ -182,8 +270,8 @@ func (vml *VMList) updateAdmissionCapacityLocked() {
 
 func (vml *VMList) reconcileCountsLocked(reason string) {
 	availableByNode := make(map[string]int, len(vml.NodeVMCount))
-	for _, vm := range vml.VMs {
-		availableByNode[vm.Node]++
+	for node, pool := range vml.idleVMsByNode {
+		availableByNode[node] = len(pool)
 	}
 
 	sumNode := 0
@@ -242,6 +330,179 @@ func (vml *VMList) reconcileCountsLocked(reason string) {
 	}
 }
 
+func (vml *VMList) appendIdleVMLocked(vm *VMMetadata) {
+	pool, ok := vml.idleVMsByNode[vm.Node]
+	if !ok {
+		pool = make([]*VMMetadata, 0, 1)
+	}
+	pool = append(pool, vm)
+	vml.idleVMsByNode[vm.Node] = pool
+}
+
+func (vml *VMList) idleVMCountLocked() int {
+	total := 0
+	for _, pool := range vml.idleVMsByNode {
+		total += len(pool)
+	}
+	return total
+}
+
+func (vml *VMList) popMostRecentIdleVMFromNodeLocked(node string) *VMMetadata {
+	pool := vml.idleVMsByNode[node]
+	if len(pool) == 0 {
+		return nil
+	}
+
+	lastIndex := len(pool) - 1
+	vm := pool[lastIndex]
+	vml.idleVMsByNode[node] = pool[:lastIndex]
+	return vm
+}
+
+func (vml *VMList) markVMInUse(vm *VMMetadata) {
+	if vm == nil || vm.InUse {
+		return
+	}
+	vm.InUse = true
+	if vml.nodeLoadTracker != nil {
+		vml.nodeLoadTracker.AddActiveRequests(vm.Node, 1)
+	}
+}
+
+func (vml *VMList) releaseVMUseLocked(vm *VMMetadata) {
+	if vm == nil || !vm.InUse {
+		return
+	}
+	vm.InUse = false
+	if vml.nodeLoadTracker != nil {
+		vml.nodeLoadTracker.AddActiveRequests(vm.Node, -1)
+	}
+}
+
+func (vml *VMList) selectAcquireNodeLocked() string {
+	candidateNodes := make([]string, 0, len(vml.Nodes))
+	var minActive int64
+	var minPrimary int64
+	for i, node := range vml.Nodes {
+		pool := vml.idleVMsByNode[node]
+		if len(pool) == 0 {
+			continue
+		}
+
+		var active int64
+		var primary int64
+		if vml.nodeLoadTracker != nil {
+			if load, ok := vml.nodeLoadTracker.Load(node); ok {
+				active = load.ActiveRequests
+				primary = load.LiveVMs + load.CreateInFlight
+			}
+		} else {
+			primary = int64(vml.NodeVMCount[node] + vml.NodeCreateInFlight[node])
+		}
+
+		if i == 0 || len(candidateNodes) == 0 || active < minActive || (active == minActive && primary < minPrimary) {
+			minActive = active
+			minPrimary = primary
+			candidateNodes = candidateNodes[:0]
+			candidateNodes = append(candidateNodes, node)
+		} else if active == minActive && primary == minPrimary {
+			candidateNodes = append(candidateNodes, node)
+		}
+	}
+
+	if len(candidateNodes) == 0 {
+		return ""
+	}
+
+	node := candidateNodes[0]
+	if len(candidateNodes) > 1 {
+		node = candidateNodes[vml.nextAcquireNodeIndex%len(candidateNodes)]
+		vml.nextAcquireNodeIndex++
+	}
+	return node
+}
+
+func (vml *VMList) cleanupNodePressure(node string) (pressure int64, active int64) {
+	if vml.nodeLoadTracker != nil {
+		if load, ok := vml.nodeLoadTracker.Load(node); ok {
+			return load.LiveVMs + load.CreateInFlight, load.ActiveRequests
+		}
+	}
+	return int64(vml.NodeVMCount[node] + vml.NodeCreateInFlight[node]), 0
+}
+
+type cleanupNodeState struct {
+	node            string
+	pool            []*VMMetadata
+	removablePrefix int
+	pressure        int64
+	active          int64
+}
+
+func (vml *VMList) selectCleanupPlanLocked(currentTimeMs int64) (map[string][]*VMMetadata, []*VMMetadata) {
+	keptIdleVMsByNode := make(map[string][]*VMMetadata, len(vml.idleVMsByNode))
+	vmsToRemove := make([]*VMMetadata, 0)
+
+	removableBudget := vml.TotalVMCount - vml.revScale.MinScale
+	if removableBudget <= 0 {
+		for node, pool := range vml.idleVMsByNode {
+			keptIdleVMsByNode[node] = pool
+		}
+		return keptIdleVMsByNode, vmsToRemove
+	}
+
+	keepaliveMs := int64(vml.keepaliveDurationSec * 1000)
+	states := make([]cleanupNodeState, 0, len(vml.idleVMsByNode))
+	for node, pool := range vml.idleVMsByNode {
+		removablePrefix := 0
+		for removablePrefix < len(pool) && currentTimeMs-pool[removablePrefix].LastTimeUsedMs > keepaliveMs {
+			removablePrefix++
+		}
+
+		pressure, active := vml.cleanupNodePressure(node)
+		states = append(states, cleanupNodeState{
+			node:            node,
+			pool:            pool,
+			removablePrefix: removablePrefix,
+			pressure:        pressure,
+			active:          active,
+		})
+	}
+
+	for removableBudget > 0 {
+		best := -1
+		for i := range states {
+			state := states[i]
+			if state.removablePrefix == 0 {
+				continue
+			}
+			if best == -1 ||
+				state.pressure > states[best].pressure ||
+				(state.pressure == states[best].pressure && state.active < states[best].active) ||
+				(state.pressure == states[best].pressure && state.active == states[best].active &&
+					state.pool[0].LastTimeUsedMs < states[best].pool[0].LastTimeUsedMs) ||
+				(state.pressure == states[best].pressure && state.active == states[best].active &&
+					state.pool[0].LastTimeUsedMs == states[best].pool[0].LastTimeUsedMs &&
+					state.node < states[best].node) {
+				best = i
+			}
+		}
+		if best == -1 {
+			break
+		}
+
+		vmsToRemove = append(vmsToRemove, states[best].pool[0])
+		states[best].pool = states[best].pool[1:]
+		states[best].removablePrefix--
+		removableBudget--
+	}
+
+	for _, state := range states {
+		keptIdleVMsByNode[state.node] = state.pool
+	}
+	return keptIdleVMsByNode, vmsToRemove
+}
+
 func (vml *VMList) removeVMFromOrchestrator(vm *VMMetadata) bool {
 	vml.Lock.RLock()
 	client, ok := vml.khalaGrpcClient[vm.Node]
@@ -267,7 +528,7 @@ func (vml *VMList) removeVMFromOrchestrator(vm *VMMetadata) bool {
 func (vml *VMList) removeVMFromOrchestratorWithRetry(vm *VMMetadata, reason string) {
 	for attempt := 1; attempt <= removeVMMaxAttempts; attempt++ {
 		if vml.removeVMFromOrchestrator(vm) {
-			vml.logger.Infof("khala: removed %s VM: %v", reason, vm)
+			vml.logger.Debugf("khala: removed %s VM: %v", reason, vm)
 			return
 		}
 		if attempt == removeVMMaxAttempts {
@@ -312,6 +573,7 @@ func (vml *VMList) AcquireVM(ctx context.Context) (func(), *VMMetadata) {
 					return nil, nil
 				}
 				if vm != nil {
+					vml.markVMInUse(vm)
 					return func() { vml.PushVM(vm, true) }, vm
 				}
 				// Fall through to wait/retry on create failure.
@@ -387,7 +649,7 @@ func (vml *VMList) createForRequest(ctx context.Context) (*VMMetadata, bool) {
 				vml.logger.Errorf("khala: detached VM create failed: %v", res.err)
 				return
 			}
-			vml.logger.Infof("khala: detached VM create completed: %v", res.vm)
+			vml.logger.Debugf("khala: detached VM create completed: %v", res.vm)
 			vml.PushVM(res.vm, true)
 		}()
 		return nil, true
@@ -399,7 +661,7 @@ func (vml *VMList) createForRequest(ctx context.Context) (*VMMetadata, bool) {
 			vml.logger.Errorf("khala: failed to create VM: %v", res.err)
 			return nil, false
 		}
-		vml.logger.Infof("khala: created VM inline: %v", res.vm)
+		vml.logger.Debugf("khala: created VM inline: %v", res.vm)
 		return res.vm, false
 	}
 }
@@ -421,7 +683,7 @@ func (vml *VMList) releaseCreatePermit() {
 	}
 }
 
-// PopVM finds and pops the most recently used VM from the next node in the round-robin sequence.
+// PopVM finds and pops the most recently used idle VM from the selected node.
 func (vml *VMList) PopVM() *VMMetadata {
 	vml.Lock.Lock()
 	defer vml.Lock.Unlock()
@@ -430,13 +692,13 @@ func (vml *VMList) PopVM() *VMMetadata {
 		return nil
 	}
 
-	if len(vml.VMs) > 0 {
-		// Pop the last element (which is the most recently used).
-		lastIndex := len(vml.VMs) - 1
-		vm := vml.VMs[lastIndex]
+	node := vml.selectAcquireNodeLocked()
+	if node == "" {
+		return nil
+	}
 
-		// Update the slice for this node.
-		vml.VMs = vml.VMs[:lastIndex]
+	if vm := vml.popMostRecentIdleVMFromNodeLocked(node); vm != nil {
+		vml.markVMInUse(vm)
 		vml.logger.Debugf("khala: popped VM %s from node %s", vm.ID, vm.Node)
 		return vm
 	}
@@ -450,11 +712,12 @@ func (vml *VMList) PushVM(vm *VMMetadata, resetRetryCount bool) {
 	vml.Lock.Lock()
 	defer vml.Lock.Unlock()
 
+	vml.releaseVMUseLocked(vm)
 	vm.LastTimeUsedMs = time.Now().UnixMilli()
 	if resetRetryCount {
 		vm.RetryCount = 0
 	}
-	vml.VMs = append(vml.VMs, vm)
+	vml.appendIdleVMLocked(vm)
 	vml.logger.Debugf("khala: pushed VM %s", vm.ID)
 
 	// Signal exactly one waiter that a VM is available.
@@ -490,7 +753,7 @@ func validateAddVMResponse(resp *khala.AddVMResponse) error {
 	return nil
 }
 
-// CreateVM creates a new VM on the node with the fewest active VMs.
+// CreateVM creates a new VM on the least-loaded node according to the shared tracker.
 func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 	vml.Lock.Lock()
 
@@ -504,23 +767,10 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		return nil, fmt.Errorf("maximum scale reached: %d", vml.revScale.MaxScale)
 	}
 
-	candidateNodes := make([]string, 0, len(vml.Nodes))
-	minCount := 0
-	for i, node := range vml.Nodes {
-		count := vml.NodeVMCount[node] + vml.NodeCreateInFlight[node]
-		if i == 0 || count < minCount {
-			minCount = count
-			candidateNodes = candidateNodes[:0]
-			candidateNodes = append(candidateNodes, node)
-		} else if count == minCount {
-			candidateNodes = append(candidateNodes, node)
-		}
-	}
-
-	minNode := candidateNodes[0]
-	if len(candidateNodes) > 1 {
-		minNode = candidateNodes[vml.nextNodeIndex%len(candidateNodes)]
-		vml.nextNodeIndex++
+	minNode := vml.selectCreateNodeLocked()
+	if minNode == "" {
+		vml.Lock.Unlock()
+		return nil, fmt.Errorf("no nodes available to create a VM")
 	}
 
 	client, ok := vml.khalaGrpcClient[minNode]
@@ -533,6 +783,9 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 	// confirmed create success.
 	vml.NodeCreateInFlight[minNode]++
 	vml.CreateInFlight++
+	if vml.nodeLoadTracker != nil {
+		vml.nodeLoadTracker.AddCreateInFlight(minNode, 1)
+	}
 	vml.updateAdmissionCapacityLocked()
 	recordVMCreateInFlight(vml.CreateInFlight)
 	vml.Lock.Unlock()
@@ -550,6 +803,9 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 		vml.Lock.Lock()
 		vml.NodeCreateInFlight[minNode]--
 		vml.CreateInFlight--
+		if vml.nodeLoadTracker != nil {
+			vml.nodeLoadTracker.AddCreateInFlight(minNode, -1)
+		}
 		vml.reconcileCountsLocked("create-failure")
 		vml.updateAdmissionCapacityLocked()
 		recordVMCreateInFlight(vml.CreateInFlight)
@@ -576,13 +832,21 @@ func (vml *VMList) CreateVM(ctx context.Context) (*VMMetadata, error) {
 	vml.Lock.Lock()
 	vml.NodeCreateInFlight[minNode]--
 	vml.CreateInFlight--
+	if vml.nodeLoadTracker != nil {
+		vml.nodeLoadTracker.AddCreateInFlight(minNode, -1)
+		vml.nodeLoadTracker.AddLiveVM(minNode, 1)
+	}
 	vml.NodeVMCount[minNode]++
 	vml.TotalVMCount++
 	vml.reconcileCountsLocked("create-success")
 	vml.updateAdmissionCapacityLocked()
+	vmCountUpdateFunc, totalVMCount, perNodeVMCount := vml.vmCountUpdateLocked()
 	recordVMCreateInFlight(vml.CreateInFlight)
 	vml.Lock.Unlock()
 	recordVMCreateSuccess()
+	if vmCountUpdateFunc != nil {
+		vmCountUpdateFunc(totalVMCount, perNodeVMCount)
+	}
 
 	vml.logger.Infow("khala: VM create succeeded",
 		"workload", vml.Workload,
@@ -646,7 +910,7 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 		go func() {
 			var ticker *time.Ticker
 
-			vml.logger.Infof("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
+			vml.logger.Debugf("khala: starting RemoveVMsWithLeastRecentUse for workload %s", vml.Workload)
 			ticker = time.NewTicker(time.Duration(vml.updateIntervalSec) * time.Second)
 
 			defer ticker.Stop()
@@ -659,24 +923,8 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 				case <-ticker.C:
 					currentTimeMs := time.Now().UnixMilli()
 					vml.Lock.Lock()
-					keptVMs := make([]*VMMetadata, 0, len(vml.VMs))
-					vmsToRemove := make([]*VMMetadata, 0)
-					// Limit this cleanup pass so we never schedule removals below minScale.
-					removableBudget := vml.TotalVMCount - vml.revScale.MinScale
-					if removableBudget < 0 {
-						removableBudget = 0
-					}
-					for _, vm := range vml.VMs {
-						if currentTimeMs-vm.LastTimeUsedMs > int64(vml.keepaliveDurationSec*1000) {
-							if removableBudget > 0 {
-								vmsToRemove = append(vmsToRemove, vm)
-								removableBudget--
-								continue
-							}
-						}
-						keptVMs = append(keptVMs, vm)
-					}
-					vml.VMs = keptVMs
+					keptIdleVMsByNode, vmsToRemove := vml.selectCleanupPlanLocked(currentTimeMs)
+					vml.idleVMsByNode = keptIdleVMsByNode
 					vml.reconcileCountsLocked("cleanup-scan")
 					vml.Lock.Unlock()
 
@@ -688,10 +936,17 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 						if vml.TotalVMCount > 0 {
 							vml.TotalVMCount--
 						}
+						if vml.nodeLoadTracker != nil {
+							vml.nodeLoadTracker.AddLiveVM(vm.Node, -1)
+						}
 						vml.reconcileCountsLocked("cleanup-remove")
 						vml.updateAdmissionCapacityLocked()
+						vmCountUpdateFunc, totalVMCount, perNodeVMCount := vml.vmCountUpdateLocked()
 						vml.Lock.Unlock()
 
+						if vmCountUpdateFunc != nil {
+							vmCountUpdateFunc(totalVMCount, perNodeVMCount)
+						}
 						vml.signalWaiters()
 						go vml.removeVMFromOrchestratorWithRetry(vm, "idle")
 					}
@@ -702,7 +957,10 @@ func (vml *VMList) RemoveVMsWithLeastRecentUse(ctx context.Context) {
 }
 
 func (vml *VMList) InvalidateVM(vm *VMMetadata) {
-	vml.logger.Infof("khala: vm failed to serve request, invalidating VM: %v", vm)
+	vml.logger.Debugf("khala: vm failed to serve request, invalidating VM: %v", vm)
+	vml.Lock.Lock()
+	vml.releaseVMUseLocked(vm)
+	vml.Lock.Unlock()
 	if vm.RetryCount < 3 {
 		vm.RetryCount++
 		vml.logger.Debugf("khala: VM %s retry count increased to %d", vm.ID, vm.RetryCount)
@@ -715,10 +973,17 @@ func (vml *VMList) InvalidateVM(vm *VMMetadata) {
 		if vml.TotalVMCount > 0 {
 			vml.TotalVMCount--
 		}
+		if vml.nodeLoadTracker != nil {
+			vml.nodeLoadTracker.AddLiveVM(vm.Node, -1)
+		}
 		vml.reconcileCountsLocked("invalidate-remove")
 		vml.updateAdmissionCapacityLocked()
+		vmCountUpdateFunc, totalVMCount, perNodeVMCount := vml.vmCountUpdateLocked()
 		vml.Lock.Unlock()
 
+		if vmCountUpdateFunc != nil {
+			vmCountUpdateFunc(totalVMCount, perNodeVMCount)
+		}
 		vml.signalWaiters()
 		go func() {
 			vml.removeVMFromOrchestratorWithRetry(vm, "invalid")

@@ -63,6 +63,36 @@ type tryResult struct {
 	err  error
 }
 
+type vmCountReport struct {
+	total   int
+	perNode map[string]int
+}
+
+type fakeDeployedVMCountReporter struct {
+	mu      sync.Mutex
+	reports []vmCountReport
+}
+
+func (f *fakeDeployedVMCountReporter) Report(total int, perNode map[string]int) {
+	copied := make(map[string]int, len(perNode))
+	for node, count := range perNode {
+		copied[node] = count
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reports = append(f.reports, vmCountReport{
+		total:   total,
+		perNode: copied,
+	})
+}
+
+func (f *fakeDeployedVMCountReporter) LastReport() vmCountReport {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reports[len(f.reports)-1]
+}
+
 func newTestThrottler(ctx context.Context) *Throttler {
 	return newThrottler(ctx, "10.10.10.10", func(context.Context) ([]string, error) {
 		return []string{"127.0.0.1"}, nil
@@ -84,6 +114,12 @@ func TestNewThrottlerUsesInjectedNodeSource(t *testing.T) {
 	if diff := cmp.Diff(want, throttler.nodes); diff != "" {
 		t.Fatalf("nodes mismatch (-want,+got):\n%s", diff)
 	}
+	if throttler.nodeLoadTracker == nil {
+		t.Fatal("newThrottler() left nodeLoadTracker nil")
+	}
+	if got := throttler.nodeLoadTracker.NodeCount(); got != len(want) {
+		t.Fatalf("nodeLoadTracker.NodeCount() = %d, want %d", got, len(want))
+	}
 }
 
 func TestNewThrottlerNodeDiscoveryFailureUsesEmptyNodeList(t *testing.T) {
@@ -99,6 +135,101 @@ func TestNewThrottlerNodeDiscoveryFailureUsesEmptyNodeList(t *testing.T) {
 	}
 	if got := len(throttler.nodes); got != 0 {
 		t.Fatalf("len(nodes) = %d, want 0", got)
+	}
+	if throttler.nodeLoadTracker == nil {
+		t.Fatal("newThrottler() left nodeLoadTracker nil")
+	}
+	if got := throttler.nodeLoadTracker.NodeCount(); got != 0 {
+		t.Fatalf("nodeLoadTracker.NodeCount() = %d, want 0", got)
+	}
+}
+
+func TestNewRevisionThrottlerWithNodeLoadTrackerSharesTrackerWithVMList(t *testing.T) {
+	tracker := khala.NewNodeLoadTracker([]string{"127.0.0.1"})
+	rt := newRevisionThrottlerWithNodeLoadTracker(
+		types.NamespacedName{Namespace: testNamespace, Name: testRevision},
+		1,
+		pkgnet.ServicePortNameHTTP1,
+		testBreakerParams,
+		[]string{"127.0.0.1"},
+		map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "10",
+		},
+		TestLogger(t),
+		tracker,
+	)
+
+	if rt.nodeLoadTracker != tracker {
+		t.Fatal("revisionThrottler did not retain shared node load tracker")
+	}
+	if rt.vmList == nil {
+		t.Fatal("revisionThrottler created nil vmList")
+	}
+	if rt.vmList.NodeLoadTracker() != tracker {
+		t.Fatal("vmList did not retain shared node load tracker")
+	}
+}
+
+func TestRevisionThrottlerSetVMCountReporterReportsCurrentCounts(t *testing.T) {
+	rt := newRevisionThrottler(
+		types.NamespacedName{Namespace: testNamespace, Name: testRevision},
+		1,
+		pkgnet.ServicePortNameHTTP1,
+		testBreakerParams,
+		[]string{"127.0.0.1"},
+		map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "10",
+		},
+		TestLogger(t),
+	)
+
+	rt.vmList.Lock.Lock()
+	rt.vmList.TotalVMCount = 2
+	rt.vmList.NodeVMCount["127.0.0.1"] = 2
+	rt.vmList.Lock.Unlock()
+
+	reporter := &fakeDeployedVMCountReporter{}
+	rt.setVMCountReporter(reporter)
+
+	if got := reporter.LastReport(); got.total != 2 || got.perNode["127.0.0.1"] != 2 {
+		t.Fatalf("initial deployed VM report = %#v, want total=2 node=2", got)
+	}
+}
+
+func TestRevisionDeletedReportsZeroDeployedVMCounts(t *testing.T) {
+	ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
+	defer cancel()
+
+	throttler := newTestThrottler(ctx)
+	revID := types.NamespacedName{Namespace: testNamespace, Name: testRevision}
+	rt := newRevisionThrottler(
+		revID,
+		1,
+		pkgnet.ServicePortNameHTTP1,
+		testBreakerParams,
+		[]string{"127.0.0.1"},
+		map[string]string{
+			khalaapis.KhalaMaxScaleAnnotationKey: "10",
+		},
+		TestLogger(t),
+	)
+
+	rt.vmList.Lock.Lock()
+	rt.vmList.TotalVMCount = 1
+	rt.vmList.NodeVMCount["127.0.0.1"] = 1
+	rt.vmList.Lock.Unlock()
+
+	reporter := &fakeDeployedVMCountReporter{}
+	rt.setVMCountReporter(reporter)
+	throttler.revisionThrottlers[revID] = rt
+
+	throttler.revisionDeleted(revisionCC1(revID, pkgnet.ProtocolHTTP1))
+
+	if got := reporter.LastReport(); got.total != 0 || got.perNode["127.0.0.1"] != 0 {
+		t.Fatalf("final deployed VM report = %#v, want zero counts", got)
+	}
+	if _, ok := throttler.revisionThrottlers[revID]; ok {
+		t.Fatalf("revision throttler %s was not deleted", revID)
 	}
 }
 
