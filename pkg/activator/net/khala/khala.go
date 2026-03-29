@@ -77,7 +77,9 @@ func NewRevVMList(extractedName string, nodes []string, revScale RevisionScaleIn
 	keepAlive := GetEnv("KEEPALIVE_DURATION", 60)
 	updateInt := GetEnv("UPDATE_INTERVAL", 5)
 	createConcurrencyPerNode := clampCreateConcurrency(GetEnv("CREATE_CONCURRENCY", 3))
-	createConcurrency := computeCreateConcurrency(createConcurrencyPerNode, len(nodes))
+	// createConcurrency := computeCreateConcurrency(createConcurrencyPerNode, len(nodes))
+	// we don't need this to scale w.r.t. cluster size because when we scale, we keep the RPS and scale number of functions
+	createConcurrency := max(createConcurrencyPerNode, 1)
 	createTimeoutSec := GetEnv("CREATE_TIMEOUT_SECONDS", 300)
 	if createTimeoutSec <= 0 {
 		createTimeoutSec = 300
