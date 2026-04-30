@@ -49,6 +49,9 @@ const (
 	requestQueueHTTPPortName  = "queue-port"
 	requestQueueHTTPSPortName = "https-port" // must be no more than 15 characters.
 	profilingPortName         = "profiling-port"
+	billingUserAnnotation     = "knbill.dev/user-id"
+	billingAppAnnotation      = "knbill.dev/app-id"
+	billingFuncAnnotation     = "knbill.dev/func-id"
 )
 
 var (
@@ -420,6 +423,35 @@ func makeQueueContainer(rev *v1.Revision, cfg *config.Config) (*corev1.Container
 				},
 			},
 		}, {
+			Name: "NODE_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					APIVersion: "v1",
+					FieldPath:  "status.hostIP",
+				},
+			},
+		}, {
+			Name: "USER_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: billingAnnotationFieldPath(billingUserAnnotation),
+				},
+			},
+		}, {
+			Name: "APP_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: billingAnnotationFieldPath(billingAppAnnotation),
+				},
+			},
+		}, {
+			Name: "FUNC_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: billingAnnotationFieldPath(billingFuncAnnotation),
+				},
+			},
+		}, {
 			Name:  "ENABLE_HTTP2_AUTO_DETECTION",
 			Value: strconv.FormatBool(cfg.Features.AutoDetectHTTP2 == apicfg.Enabled),
 		}, {
@@ -450,6 +482,10 @@ func makeQueueContainer(rev *v1.Revision, cfg *config.Config) (*corev1.Container
 	}
 
 	return c, nil
+}
+
+func billingAnnotationFieldPath(annotation string) string {
+	return fmt.Sprintf("metadata.annotations['%s']", annotation)
 }
 
 func applyReadinessProbeDefaults(p *corev1.Probe, port int32) {

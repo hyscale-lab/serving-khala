@@ -151,6 +151,26 @@ var (
 				FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.hostIP"},
 			},
 		}, {
+			Name: "NODE_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.hostIP"},
+			},
+		}, {
+			Name: "USER_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['knbill.dev/user-id']"},
+			},
+		}, {
+			Name: "APP_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['knbill.dev/app-id']"},
+			},
+		}, {
+			Name: "FUNC_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['knbill.dev/func-id']"},
+			},
+		}, {
 			Name:  "ENABLE_HTTP2_AUTO_DETECTION",
 			Value: "false",
 		}, {

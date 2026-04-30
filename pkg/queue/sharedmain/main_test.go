@@ -174,6 +174,22 @@ func TestEnv(t *testing.T) {
 		"SERVING_POD_IP",
 		"1.1.1.1",
 		"ServingPodIP",
+	}, {
+		"USER_ID",
+		"user",
+		"BillingUserID",
+	}, {
+		"APP_ID",
+		"app",
+		"BillingAppID",
+	}, {
+		"FUNC_ID",
+		"func",
+		"BillingFuncID",
+	}, {
+		"NODE_IP",
+		"10.0.0.1",
+		"BillingNodeIP",
 	}}
 
 	for _, v := range envVars {

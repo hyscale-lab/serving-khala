@@ -31,6 +31,7 @@ import (
 	pkghandler "knative.dev/pkg/network/handlers"
 	"knative.dev/serving/pkg/http/handler"
 	"knative.dev/serving/pkg/queue"
+	"knative.dev/serving/pkg/queue/billing"
 	"knative.dev/serving/pkg/queue/health"
 )
 
@@ -47,6 +48,7 @@ func mainHandler(
 	logger *zap.SugaredLogger,
 	mp metric.MeterProvider,
 	tp trace.TracerProvider,
+	billingEmitter *billing.Emitter,
 ) (http.Handler, drainers) {
 	var drainers drainers
 	tracer := tp.Tracer("knative.dev/serving/pkg/queue")
@@ -65,6 +67,7 @@ func mainHandler(
 	// Note: innermost handlers are specified first, ie. the last handler in the chain will be executed first.
 	composedHandler := d.ProxyHandler
 
+	composedHandler = billing.Handler(composedHandler, billingEmitter)
 	composedHandler = requestAppMetricsHandler(logger, composedHandler, breaker, mp)
 	composedHandler = queue.ProxyHandler(tracer, breaker, stats, composedHandler)
 	composedHandler = queue.ForwardedShimHandler(composedHandler)

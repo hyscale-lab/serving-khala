@@ -1177,6 +1177,26 @@ func env(overrides map[string]string) []corev1.EnvVar {
 		ValueFrom: &corev1.EnvVarSource{
 			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"},
 		},
+	}, {
+		Name: "NODE_IP",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.hostIP"},
+		},
+	}, {
+		Name: "USER_ID",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['knbill.dev/user-id']"},
+		},
+	}, {
+		Name: "APP_ID",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['knbill.dev/app-id']"},
+		},
+	}, {
+		Name: "FUNC_ID",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['knbill.dev/func-id']"},
+		},
 	}}...)
 
 	sortEnv(env)

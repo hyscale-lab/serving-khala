@@ -53,6 +53,7 @@ import (
 	"knative.dev/serving/pkg/networking"
 	"knative.dev/serving/pkg/observability"
 	"knative.dev/serving/pkg/queue"
+	"knative.dev/serving/pkg/queue/billing"
 	"knative.dev/serving/pkg/queue/certificate"
 	"knative.dev/serving/pkg/queue/readiness"
 )
@@ -106,6 +107,13 @@ type config struct {
 
 	// Metrics, Tracing and Profiling
 	Observability observability.Config `ignored:"true"`
+
+	// Billing metadata and local node target. These are optional; billing is
+	// disabled unless all values are present.
+	BillingUserID string `envconfig:"USER_ID"`
+	BillingAppID  string `envconfig:"APP_ID"`
+	BillingFuncID string `envconfig:"FUNC_ID"`
+	BillingNodeIP string `envconfig:"NODE_IP"`
 
 	Env
 }
@@ -221,6 +229,8 @@ func Main(opts ...Option) error {
 
 	d.Transport = buildTransport(env, tp, mp)
 	proxyHandler := buildProxyHandler(logger, env, d.Transport)
+	billingEmitter := buildBillingEmitter(logger, env)
+	defer billingEmitter.Close()
 
 	applyOptions(&d, proxyHandler, opts...)
 
@@ -246,7 +256,7 @@ func Main(opts ...Option) error {
 	// Enable TLS when certificate is mounted.
 	tlsEnabled := exists(logger, certPath) && exists(logger, keyPath)
 
-	mainHandler, drainers := mainHandler(env, d, probe, stats, logger, mp, tp)
+	mainHandler, drainers := mainHandler(env, d, probe, stats, logger, mp, tp, billingEmitter)
 	adminHandler := adminHandler(d.Ctx, logger, drainers.StandardDrainer)
 
 	// Enable TLS server when activator server certs are mounted.
@@ -401,6 +411,27 @@ func buildProxyHandler(logger *zap.SugaredLogger, env config, transport http.Rou
 	httpProxy.FlushInterval = netproxy.FlushInterval
 
 	return httpProxy
+}
+
+func buildBillingEmitter(logger *zap.SugaredLogger, env config) *billing.Emitter {
+	emitter, err := billing.NewUDPEmitter(billing.Metadata{
+		UserID: env.BillingUserID,
+		AppID:  env.BillingAppID,
+		FuncID: env.BillingFuncID,
+	}, env.BillingNodeIP, billing.DefaultPort, billing.DefaultQueueDepth)
+	if err == nil {
+		logger.Infow("Queue-proxy billing emitter enabled",
+			zap.String("nodeIP", env.BillingNodeIP),
+			zap.Int("port", billing.DefaultPort))
+		return emitter
+	}
+	if errors.Is(err, billing.ErrDisabled) {
+		logger.Debugw("Queue-proxy billing emitter disabled", zap.Error(err))
+		return nil
+	}
+
+	logger.Warnw("Queue-proxy billing emitter disabled after UDP setup failure", zap.Error(err))
+	return nil
 }
 
 func buildBreaker(logger *zap.SugaredLogger, env config) *queue.Breaker {
